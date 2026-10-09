@@ -235,8 +235,10 @@ runtime recovers in this order:
 
 Tools that are not registered are treated as not replayable with side
 effects. A delegation call has side effects, and is not replayable, when any
-tool available to sub-agents has side effects; on recovery it needs review
-when one of its sub-agent calls has pending or unknown external effects.
+tool available to sub-agents has side effects. On recovery it needs review
+when one of its sub-agent calls has pending external effects, or when its
+sub-agent started a call with side effects that cannot be repeated, whatever
+that call's status.
 
 ## Output control
 
