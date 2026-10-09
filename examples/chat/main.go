@@ -64,8 +64,8 @@ func chat(ctx context.Context) error {
 		return err
 	}
 	maxOutput, err := strconv.Atoi(env("EINORUN_MAX_OUTPUT_TOKENS", "4096"))
-	if err != nil {
-		return fmt.Errorf("EINORUN_MAX_OUTPUT_TOKENS: %w", err)
+	if err != nil || maxOutput <= 0 {
+		return errors.New("EINORUN_MAX_OUTPUT_TOKENS must be a positive number")
 	}
 	config := provider.ChatConfig{
 		Brand:    vendor.Brand(env("EINORUN_BRAND", "openai")),
@@ -90,7 +90,8 @@ func chat(ctx context.Context) error {
 	}
 	runtime := einorun.New(einorun.Config{Language: language})
 	feed := inmem.NewFeed()
-	lines := readLines()
+	var readErr error
+	lines := readLines(&readErr)
 	for turn := 1; ; turn++ {
 		fmt.Print("> ")
 		var line string
@@ -100,7 +101,7 @@ func chat(ctx context.Context) error {
 			return nil
 		case read, ok := <-lines:
 			if !ok {
-				return nil
+				return readErr
 			}
 			line = read
 		}
@@ -140,8 +141,9 @@ func chat(ctx context.Context) error {
 }
 
 // readLines reads the terminal in the background, so that waiting for input
-// can be interrupted.
-func readLines() <-chan string {
+// can be interrupted. When the channel closes, *err holds the read error, nil
+// at the end of the input.
+func readLines(err *error) <-chan string {
 	lines := make(chan string)
 	go func() {
 		defer close(lines)
@@ -150,6 +152,7 @@ func readLines() <-chan string {
 		for input.Scan() {
 			lines <- input.Text()
 		}
+		*err = input.Err()
 	}()
 	return lines
 }
