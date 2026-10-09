@@ -7,7 +7,6 @@ package vendor
 import (
 	"errors"
 	"fmt"
-	"maps"
 	"net/url"
 	"strings"
 )
@@ -79,7 +78,7 @@ func (p Protocol) Supports(s Structured) bool {
 	case StructuredJSONObject:
 		return p == ProtocolOpenAI || p == ProtocolCompatible || p == ProtocolQwen || p == ProtocolDeepSeek
 	case StructuredForcedTool:
-		return p == ProtocolOpenAI || p == ProtocolCompatible || p == ProtocolQwen || p == ProtocolDeepSeek || p == ProtocolAnthropic
+		return true
 	case StructuredGemini:
 		return p == ProtocolGemini
 	}
@@ -179,7 +178,7 @@ var presets = map[Brand]Preset{
 func Of(brand Brand) (Preset, bool) {
 	preset, ok := presets[brand]
 	preset.Brand = brand
-	preset.DisableThinkingFields = maps.Clone(preset.DisableThinkingFields)
+	preset.DisableThinkingFields = deepCopy(preset.DisableThinkingFields)
 	if preset.Protocol == "" {
 		preset.Protocol = ProtocolCompatible
 	}
@@ -190,6 +189,33 @@ func Of(brand Brand) (Preset, bool) {
 		preset.Rerank = RerankCompatible
 	}
 	return preset, ok
+}
+
+// deepCopy copies a JSON-like map and the maps and slices nested in it.
+func deepCopy(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	copied := make(map[string]any, len(m))
+	for key, value := range m {
+		copied[key] = deepCopyValue(value)
+	}
+	return copied
+}
+
+// deepCopyValue copies nested maps and slices of a JSON-like value.
+func deepCopyValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		return deepCopy(v)
+	case []any:
+		copied := make([]any, len(v))
+		for i, item := range v {
+			copied[i] = deepCopyValue(item)
+		}
+		return copied
+	}
+	return value
 }
 
 // CompatibleURL normalizes endpoint to the brand's OpenAI-compatible entry

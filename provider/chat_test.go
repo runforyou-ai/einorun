@@ -287,3 +287,20 @@ func TestQwenStructuredWithoutThinking(t *testing.T) {
 		t.Fatalf("body %v", body)
 	}
 }
+
+func TestGatewayKeepsEndpoint(t *testing.T) {
+	var path string
+	server := &completions{reply: func(map[string]any) (int, string) { return http.StatusOK, completion("ok", "stop", "") }}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		server.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+	factory := Factory(ChatConfig{Brand: vendor.Alibaba, Protocol: vendor.ProtocolCompatible, BaseURL: ts.URL + "/v1", Model: "m"})
+	if _, err := ask(t, factory, llm.ModelOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if path != "/v1/chat/completions" {
+		t.Fatalf("path %s", path)
+	}
+}

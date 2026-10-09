@@ -46,8 +46,10 @@ func TestPresets(t *testing.T) {
 	}
 	p, _ := Of(Zhipu)
 	p.DisableThinkingFields["x"] = 1
-	if again, _ := Of(Zhipu); again.DisableThinkingFields["x"] != nil {
-		t.Fatal("preset shares its map")
+	p.DisableThinkingFields["thinking"].(map[string]any)["type"] = "enabled"
+	again, _ := Of(Zhipu)
+	if again.DisableThinkingFields["x"] != nil || again.DisableThinkingFields["thinking"].(map[string]any)["type"] != "disabled" {
+		t.Fatal("preset shares its maps")
 	}
 }
 

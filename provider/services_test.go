@@ -220,6 +220,23 @@ func TestRedirectsAreNotFollowed(t *testing.T) {
 	}
 }
 
+func TestTimeoutsHideCredentials(t *testing.T) {
+	release := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer ts.Close()
+	defer close(release)
+	client := &embedding.Client{HTTP: &http.Client{Timeout: 50 * time.Millisecond}}
+	_, err := client.Embed(context.Background(), embedding.Endpoint{BaseURL: ts.URL + "/v1?api_key=secret"}, "m", 2, []string{"a"})
+	if classified, ok := apierr.As(err); !ok || classified.Kind != apierr.Timeout || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("error %v", err)
+	}
+}
+
 func TestTransportErrorsHideCredentials(t *testing.T) {
 	_, err := embedding.NewClient().Embed(context.Background(), embedding.Endpoint{BaseURL: "http://user:secret@127.0.0.1:1/v1?key=secret"}, "m", 2, []string{"a"})
 	if err == nil || strings.Contains(err.Error(), "secret") {

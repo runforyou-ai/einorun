@@ -121,6 +121,12 @@ func FromTransport(err error) error {
 	if _, ok := As(err); ok {
 		return err
 	}
+	// Remove credentials from the URL before the error is wrapped anywhere.
+	if urlError, ok := errors.AsType[*url.Error](err); ok {
+		redacted := *urlError
+		redacted.URL = redactURL(urlError.URL)
+		err = &redacted
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return New(StageConnect, Timeout, err)
 	}
@@ -131,13 +137,8 @@ func FromTransport(err error) error {
 	if errors.As(err, &certificateInvalid) || errors.As(err, &hostname) || errors.As(err, &authority) || errors.As(err, &record) {
 		return New(StageConnect, TLS, err)
 	}
-	if urlError, ok := errors.AsType[*url.Error](err); ok {
-		redacted := *urlError
-		redacted.URL = redactURL(urlError.URL)
-		if redacted.Timeout() {
-			return New(StageConnect, Timeout, &redacted)
-		}
-		err = &redacted
+	if urlError, ok := errors.AsType[*url.Error](err); ok && urlError.Timeout() {
+		return New(StageConnect, Timeout, err)
 	}
 	if netError, ok := errors.AsType[net.Error](err); ok {
 		if netError.Timeout() {

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -102,13 +103,25 @@ func NewChatModel(ctx context.Context, config ChatConfig) (model.AgenticModel, e
 	if !known {
 		return nil, fmt.Errorf("provider: unknown brand %q", config.Brand)
 	}
-	baseURL, err := preset.CompatibleURL(config.BaseURL)
-	if err != nil {
-		return nil, err
-	}
 	protocol := preset.Protocol
 	if config.Protocol != "" {
 		protocol = config.Protocol
+	}
+	// The preset's endpoint rules describe the vendor's own endpoints; an
+	// endpoint reached through another protocol, such as a gateway, is used
+	// as configured.
+	var baseURL string
+	var err error
+	if protocol == preset.Protocol {
+		baseURL, err = preset.CompatibleURL(config.BaseURL)
+	} else {
+		var parsed *url.URL
+		if parsed, err = vendor.ParseURL(config.BaseURL); err == nil {
+			baseURL = strings.TrimSuffix(parsed.String(), "/")
+		}
+	}
+	if err != nil {
+		return nil, err
 	}
 	mode := vendor.StructuredNone
 	if config.Output != nil {
