@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -261,6 +262,18 @@ func (x *execution) control(ctx context.Context, a *agent, input *compose.ToolIn
 		return text(errorResult(errors.New(reason)))
 	}
 	switch {
+	case ctrl.media != nil:
+		value := strings.ReplaceAll(ctrl.media.text, "\x00", "")
+		now := time.Now()
+		call, err := x.update(ctx, a, input, func(call *ToolCall) {
+			call.Status, call.Result, call.Media, call.CompletedAt = StatusSucceeded, &value, slices.Clone(ctrl.media.refs), &now
+		})
+		if err != nil {
+			return nil, err
+		}
+		x.injector.add(input.CallID, ctrl.media.refs)
+		x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: call, Raw: value, Origin: OriginExecuted})
+		return text(value)
 	case ctrl.completion != nil:
 		if entry == nil || !entry.spec.Completion || !a.scope.Main {
 			return fail(x.text.CannotComplete)

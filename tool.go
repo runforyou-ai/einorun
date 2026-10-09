@@ -142,11 +142,14 @@ type control struct {
 	receipt    string
 	payload    json.RawMessage
 	completion *CallCompletion
+	media      *mediaResult
 }
 
 // Error describes the control result.
 func (c *control) Error() string {
 	switch {
+	case c.media != nil:
+		return "einorun: result with media"
 	case c.completion != nil:
 		return "einorun: call completes the run"
 	case c.handover == HandoverAwait:

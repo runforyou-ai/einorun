@@ -40,6 +40,10 @@ type Runtime struct {
 	MediaUnavailable string
 	// ListSeparator joins tool names.
 	ListSeparator string
+	// SummaryPreamble introduces a summary of earlier context.
+	SummaryPreamble string
+	// OffloadRead describes the tool that reads offloaded results.
+	OffloadRead string
 }
 
 var runtimes = map[string]*Runtime{
@@ -58,6 +62,8 @@ var runtimes = map[string]*Runtime{
 		FinalNoticeCompletion: "工具调用次数已达本轮上限，不能再调用其他工具。请直接给出最终回答，或单独调用 %s 结束。",
 		MediaUnavailable:      "[%s：当前模型无法查看此内容]",
 		ListSeparator:         "、",
+		SummaryPreamble:       "【较早对话摘要】此前的对话已压缩为以下摘要，摘要之后的消息保持原样。",
+		OffloadRead:           "读取本次运行中因结果过大而转存的工具输出，file_path 使用转存提示中给出的路径。",
 	},
 	"en": {
 		Cancelled:             "Tool call %[1]s (ID %[2]s) was cancelled: another message arrived before it finished.",
@@ -74,6 +80,8 @@ var runtimes = map[string]*Runtime{
 		FinalNoticeCompletion: "The tool call limit for this turn is reached; no other tools can be called. Give your final answer, or call %s on its own to finish.",
 		MediaUnavailable:      "[%s: the current model cannot view this content]",
 		ListSeparator:         ", ",
+		SummaryPreamble:       "[Summary of earlier conversation] The conversation so far is summarized below; the messages after the summary are unchanged.",
+		OffloadRead:           "Read a tool output of this run that was offloaded because it was too large; use the file_path given in the offload note.",
 	},
 }
 
