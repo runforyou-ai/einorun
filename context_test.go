@@ -119,6 +119,39 @@ func TestLongContextIsSummarized(t *testing.T) {
 	}
 }
 
+// reserving reserves context for the main agent.
+type reserving struct{ tokens int }
+
+func (r *reserving) Name() string { return "reserving" }
+
+func (r *reserving) ReservedTokens(scope einorun.AgentScope) int {
+	if !scope.Main {
+		return 0
+	}
+	return r.tokens
+}
+
+func TestReservedTokensLowerTheSummaryThreshold(t *testing.T) {
+	for _, reserved := range []int{0, 5000} {
+		main := &scripted{steps: []step{call(invocation{"lookup", `{"x":"1"}`}), call(invocation{"lookup", `{"x":"2"}`}), say("done")}}
+		s := &summaryAware{main: main}
+		feed := inmem.NewFeed()
+		for i := range 10 {
+			user(feed, "old"+string(rune('a'+i)), strings.Repeat("earlier conversation ", 10))
+		}
+		user(feed, "new", "latest question")
+		padded := &fn{name: "lookup", run: func(context.Context, string) (string, error) { return strings.Repeat("r", 1000), nil }}
+		result, err := run(t, einorun.Request{Model: einorun.Model{New: s.factory, ContextWindow: 8000}, Feed: feed,
+			Tools: []einorun.ToolSpec{{Tool: padded}}, Extensions: []einorun.Extension{&reserving{tokens: reserved}}})
+		if err != nil || result.Text != "done" {
+			t.Fatalf("%+v %v", result, err)
+		}
+		if (s.summaries > 0) != (reserved > 0) {
+			t.Fatalf("reserved %d: summaries %d", reserved, s.summaries)
+		}
+	}
+}
+
 func digest(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])

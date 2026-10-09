@@ -21,6 +21,9 @@ type Extension interface {
 type RunScope struct {
 	RunID    string
 	Language llm.Language
+	// Model is the run's model factory, for extensions that call the model
+	// themselves; they report the usage through UsageReporter.
+	Model llm.ModelFactory
 }
 
 // Instantiable extensions create one instance per run. The instance is
@@ -130,6 +133,22 @@ type InstructionProvider interface {
 // summarized, by the call identifiers the model gave.
 type PinProvider interface {
 	Pin(messages []*schema.AgenticMessage) map[string]bool
+}
+
+// ContextReserver extensions add text to an agent's model calls outside the
+// agent's state, such as a reminder added when the model is wrapped. Before
+// each model call the runtime lowers the summary threshold of the agent by the
+// tokens they report, so the call still fits the window.
+type ContextReserver interface {
+	ReservedTokens(scope AgentScope) int
+}
+
+// UsageReporter extensions report the total usage of the model calls they
+// made in this run, which the runtime adds to the run's usage. Only the usage
+// since the run's latest start counts; usage from before a restart is already
+// in the checkpoint.
+type UsageReporter interface {
+	Usage() llm.Usage
 }
 
 // Closer extensions are closed when Run returns.
