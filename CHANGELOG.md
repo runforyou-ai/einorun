@@ -7,6 +7,7 @@
 - `AttachMedia`: tool results with host media, passed to the model within the run's media budget, inside the result or as a following user message.
 - Built-in extensions: `Planning` (task list published as the run's plan), `Subagent` (delegation with sub-agent calls recorded under the delegation call) and `Skills` (Eino skills, forked skills run in a sub-agent).
 - `memory`: `Recall` extension that shows the memories relevant to each turn, and `Extract` for memory changes from a conversation. Extensions get the run's model through `RunScope.Model`, report its usage with `UsageReporter` and reserve context for text they add to model calls with `ContextReserver`; `IsInput` tells claimed input apart from messages the runtime adds.
+- `examples/chat`: a command-line agent with the in-memory feed, a provider model, a tool, the task list and sub-agents.
 - `stream`: display snapshots and deltas of a run.
 - `llm`: model contract, `Generate` and `GenerateObject`.
 - Run records, the `Feed` and `Journal` contracts and `MergeCall`.

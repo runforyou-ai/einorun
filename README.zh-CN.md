@@ -19,6 +19,15 @@ einorun 不了解你的业务。指令、工具、审批与执行器通过工具
 
 > einorun 仍在开发中，设计见 [docs/design.md](docs/design.md)。
 
+## 示例
+
+[`examples/chat`](examples/chat) 是约 150 行的命令行 Agent：内存对话、供应商模型、一个工具、任务清单与子 Agent，回复实时输出到终端。
+
+```sh
+EINORUN_BRAND=openai EINORUN_BASE_URL=https://api.openai.com/v1 \
+  EINORUN_MODEL=gpt-4.1 EINORUN_API_KEY=... go run ./examples/chat
+```
+
 ## 许可
 
 MIT
