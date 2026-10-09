@@ -47,8 +47,10 @@ type ModelOptions struct {
 
 // ModelFactory creates a chat model component. The host decides routing,
 // metering and billing inside it. The runtime calls it once per agent it
-// builds (main agent, summarizer, memory selection, each sub-agent); every
-// Generate and Stream call carries a ModelCallID in its context.
+// builds (main agent, summarizer, each sub-agent); single calls such as
+// Generate and GenerateObject, and extensions such as memory selection, call
+// it for every attempt. Every Generate and Stream call carries a ModelCallID
+// in its context.
 type ModelFactory func(ctx context.Context, options ModelOptions) (model.AgenticModel, error)
 
 // DefaultContextWindow is the context window assumed for models that do not

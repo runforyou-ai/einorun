@@ -422,10 +422,21 @@ type RestoreObserver interface { AfterRestore(ctx context.Context, view RestoreV
 type Stateful        interface { Save() (json.RawMessage, error); Restore(json.RawMessage) error }
 type InstructionProvider interface { Instruction(scope AgentScope) string }
 type PinProvider     interface { Pin(messages []*schema.AgenticMessage) map[string]bool }
+type ContextReserver interface { ReservedTokens(scope AgentScope) int }
+type UsageReporter   interface { Usage() llm.Usage }
 type Closer          interface { Close() error }
 ```
 
 - Names are unique; a duplicate is an error.
+- `RunScope` carries the run ID, the language and the run's model factory;
+  extensions that call the model themselves report the usage of this start of
+  the run through `UsageReporter`, which the runtime adds to the run's usage.
+- Extensions that add text to model calls outside the agent state (in
+  `WrapModel`) report its tokens through `ContextReserver`; before each model
+  call the runtime lowers that agent's summary threshold by them.
+- `IsInput(message)` tells model messages made from claimed input apart from
+  those the runtime adds (tool results, media carriers, summaries, notices,
+  corrections), so such text can anchor to the turn's input.
 - `Instantiable` extensions get one instance per run, shared by the main agent
   and its sub-agents; instances must be safe for concurrent use. A guard may be
   the same instance as an extension (`Request.Guard` accepts an extension
@@ -521,9 +532,18 @@ configurable.
   response-header timeout and does not follow redirects, and can be replaced.
   `embedding`, `rerank`, `discovery` and `probe` (with its own stable error
   type) complete the package.
-- `memory`: `Recall(Source, RecallOptions{Instruction, Limits})` and
-  `Extract(ctx, factory, ExtractRequest{Instruction, Entries, Earlier, Recent,
-  Language})`, which returns a change set. Default prompts use neutral wording.
+- `memory`: `Recall(Source, RecallOptions{Name, Instruction, Limits})` loads
+  the run's entries from the host's `Source` once, lists an index in the main
+  agent's instruction, picks the entries relevant to each claim with the run's
+  model (usage counted in the run, picked keys kept in the checkpoint) and
+  shows them in a reminder before the latest claimed user input of each main-agent
+  model call; the reminder never enters the history and its tokens are
+  reserved. A resumed run loads the entries again. Recall only reads; the
+  default instruction makes no promise about saving. `Extract(ctx, factory,
+  ExtractRequest{Instruction, Entries, Earlier, Recent, Now, Language,
+  Limits})` is
+  one structured call returning `Changes{Saved, Deleted, Skipped}` and the
+  usage; the host applies them. Default prompts use neutral wording.
 - `toolname`: `Namer.Name(namespace, identity, server, tool)` builds
   `<namespace>__<server>__<tool>_<digest>`: at most 64 ASCII letters, digits
   and underscores, starting with a letter or an underscore. The same
@@ -537,8 +557,9 @@ configurable.
 - `tools/web`: `web_search` and `web_fetch` over host-provided `Searcher` and
   `Fetcher`; the package validates arguments (count, time range, http/https
   addresses without user information, passed on normalized; which addresses
-  may be reached is the `Fetcher`'s decision) and fails calls as unavailable when no service is provided; all
-  of its model-facing text, errors included, can be overridden.
+  may be reached is the `Fetcher`'s decision) and fails calls as
+  unavailable when no service is provided; all of its model-facing text,
+  errors included, can be overridden.
   `SearchSpec` and `FetchSpec` register them as replayable tools without side
   effects.
 - The library's own model-facing text (cancellation, interruption, needs

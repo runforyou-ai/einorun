@@ -91,6 +91,20 @@ func mediaMaxCount(window int) int {
 	return max(1, window*mediaWindowPercent/100/mediaTokens)
 }
 
+// inputExtraKey marks the model messages made from claimed input.
+const inputExtraKey = "einorun_input"
+
+// IsInput reports whether message was made from claimed conversation input,
+// as opposed to messages the runtime adds itself: tool results, media
+// carriers, summaries, notices and corrections.
+func IsInput(message *schema.AgenticMessage) bool {
+	if message == nil {
+		return false
+	}
+	marked, _ := message.Extra[inputExtraKey].(bool)
+	return marked
+}
+
 // history is the model history of a run: claimed conversation messages and
 // complete tool interactions, in order.
 type history struct {
@@ -132,15 +146,18 @@ func (h *history) appendInput(ctx context.Context, messages []Message, media med
 		}
 	}
 	for i, m := range fresh {
+		var message *schema.AgenticMessage
 		switch {
 		case m.Role == RoleAssistant:
-			h.messages = append(h.messages, &schema.AgenticMessage{Role: schema.AgenticRoleTypeAssistant,
-				ContentBlocks: []*schema.ContentBlock{schema.NewContentBlock(&schema.AssistantGenText{Text: m.Content})}})
+			message = &schema.AgenticMessage{Role: schema.AgenticRoleTypeAssistant,
+				ContentBlocks: []*schema.ContentBlock{schema.NewContentBlock(&schema.AssistantGenText{Text: m.Content})}}
 		case inline[i] != nil:
-			h.messages = append(h.messages, inline[i])
+			message = inline[i]
 		default:
-			h.messages = append(h.messages, schema.UserAgenticMessage(m.Content))
+			message = schema.UserAgenticMessage(m.Content)
 		}
+		message.Extra = map[string]any{inputExtraKey: true}
+		h.messages = append(h.messages, message)
 	}
 	return slices.Clone(h.messages)
 }
