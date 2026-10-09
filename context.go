@@ -282,6 +282,7 @@ type summarizer struct {
 	adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]
 	inner   *summarization.TypedMiddleware[*schema.AgenticMessage]
 	trigger int64
+	reserve func() int64 // tokens extensions add to model calls outside the state
 	output  int
 	counter func(ctx context.Context, messages []*schema.AgenticMessage, tools []*schema.ToolInfo) (int64, error)
 	pin     func(messages []*schema.AgenticMessage) map[string]bool
@@ -293,7 +294,7 @@ type summarizer struct {
 }
 
 // newSummarizer creates the summarizer; summary calls use summaryModel.
-func (e *execution) newSummarizer(ctx context.Context, summaryModel model.AgenticModel) (*summarizer, error) {
+func (e *execution) newSummarizer(ctx context.Context, summaryModel model.AgenticModel, reserve func() int64) (*summarizer, error) {
 	p := e.contextPolicy
 	text := e.text
 	config := &summarization.TypedConfig[*schema.AgenticMessage]{
@@ -320,6 +321,7 @@ func (e *execution) newSummarizer(ctx context.Context, summaryModel model.Agenti
 		TypedChatModelAgentMiddleware: handler,
 		inner:                         handler.(*summarization.TypedMiddleware[*schema.AgenticMessage]),
 		trigger:                       int64(e.window - output - p.InstructionTokens),
+		reserve:                       reserve,
 		output:                        output,
 		counter:                       p.TokenCounter,
 		pin:                           e.pinned,
@@ -353,11 +355,15 @@ func (s *summarizer) restoreKeepFrom(id string) {
 // BeforeModelRewriteState summarizes when the context exceeds the threshold
 // and older messages can be summarized, and tells the history.
 func (s *summarizer) BeforeModelRewriteState(ctx context.Context, state *adk.TypedChatModelAgentState[*schema.AgenticMessage], _ *adk.TypedModelContext[*schema.AgenticMessage]) (context.Context, *adk.TypedChatModelAgentState[*schema.AgenticMessage], error) {
+	trigger := s.trigger
+	if s.reserve != nil {
+		trigger -= s.reserve()
+	}
 	tokens, err := s.counter(ctx, state.Messages, state.ToolInfos)
 	if err != nil {
 		return ctx, nil, err
 	}
-	if tokens <= s.trigger {
+	if tokens <= trigger {
 		return ctx, state, nil
 	}
 	keepFromID := s.keptFrom()
@@ -398,7 +404,7 @@ func (s *summarizer) BeforeModelRewriteState(ctx context.Context, state *adk.Typ
 		if err != nil {
 			return ctx, nil, err
 		}
-		keepAll = tail+int64(s.output) <= s.trigger
+		keepAll = tail+int64(s.output) <= trigger
 	}
 	if keepAll {
 		summarize = pinnedRest
@@ -440,7 +446,7 @@ func (s *summarizer) BeforeModelRewriteState(ctx context.Context, state *adk.Typ
 	compacted := *state
 	compacted.Messages = append(append(slices.Clone(system), event.summary), kept...)
 	after, _ := s.counter(ctx, compacted.Messages, compacted.ToolInfos)
-	slog.InfoContext(ctx, "einorun: context summarized", "run_id", s.runID, "threshold_tokens", s.trigger,
+	slog.InfoContext(ctx, "einorun: context summarized", "run_id", s.runID, "threshold_tokens", trigger,
 		"tokens_before", tokens, "tokens_after", after, "summarized_messages", len(summarize))
 	if err := adk.TypedSendEvent(ctx, &adk.TypedAgentEvent[*schema.AgenticMessage]{
 		Action: &adk.AgentAction{CustomizedAction: event},

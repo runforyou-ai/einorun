@@ -65,6 +65,7 @@ type extensionSet struct {
 	outputs  []OutputObserver
 	stateful map[string]Stateful
 	pins     []PinProvider
+	usages   []UsageReporter
 	closers  []Closer
 }
 
@@ -217,7 +218,7 @@ func (r *Runtime) assemble(ctx context.Context, request Request) (*execution, er
 func (e *execution) loadExtensions(ctx context.Context) error {
 	set := extensionSet{stateful: map[string]Stateful{}}
 	names := map[string]bool{}
-	run := RunScope{RunID: e.request.RunID, Language: e.language}
+	run := RunScope{RunID: e.request.RunID, Language: e.language, Model: e.request.Model.New}
 	for _, prototype := range e.request.Extensions {
 		instance := prototype
 		if factory, ok := prototype.(Instantiable); ok {
@@ -258,6 +259,9 @@ func (e *execution) loadExtensions(ctx context.Context) error {
 		}
 		if p, ok := instance.(PinProvider); ok {
 			set.pins = append(set.pins, p)
+		}
+		if u, ok := instance.(UsageReporter); ok {
+			set.usages = append(set.usages, u)
 		}
 	}
 	if set.guard == nil {
@@ -421,7 +425,19 @@ func (e *execution) buildAgent(ctx context.Context, a *agent, instruction string
 	e.agentsMu.Lock()
 	e.auxiliary = append(e.auxiliary, accounted)
 	e.agentsMu.Unlock()
-	a.summary, err = e.newSummarizer(ctx, accounted)
+	var reservers []ContextReserver
+	for _, ext := range e.extensions.all {
+		if r, ok := ext.(ContextReserver); ok {
+			reservers = append(reservers, r)
+		}
+	}
+	a.summary, err = e.newSummarizer(ctx, accounted, func() int64 {
+		var total int64
+		for _, r := range reservers {
+			total += int64(max(r.ReservedTokens(a.scope), 0))
+		}
+		return total
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -817,6 +833,9 @@ func (e *execution) totalUsage() llm.Usage {
 		total.Add(m.used())
 	}
 	total.Add(e.subUsage)
+	for _, u := range e.extensions.usages {
+		total.Add(u.Usage())
+	}
 	return total
 }
 
