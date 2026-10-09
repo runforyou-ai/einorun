@@ -16,13 +16,29 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
-// agent is the per-agent state of tool execution.
+// agent is the per-agent state of an agent of the run.
 type agent struct {
 	scope AgentScope
 	// parentCallID is the provider call ID of the delegation call a sub-agent
 	// serves; empty for the main agent.
 	parentCallID string
 	raw          rawResults
+	budget       *budgetGuard
+	injector     *mediaInjector
+	offloaded    *offloadStore
+	retry        *modelRetry
+	summary      *summarizer
+	recorder     *subagentRecorder // a sub-agent's recorder
+	// modelCalls maps a sub-agent's provider call IDs to the model call that
+	// made them.
+	modelCalls sync.Map
+}
+
+// modelCallOf returns the model call that made a sub-agent's call.
+func (a *agent) modelCallOf(providerCallID string) string {
+	id, _ := a.modelCalls.Load(providerCallID)
+	s, _ := id.(string)
+	return s
 }
 
 // rawResults keeps the result each tool returned before context management
@@ -221,6 +237,10 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 	// they come from the run's context or from the tool's own.
 	_, interrupted := compose.ExtractInterruptInfo(execErr)
 	if abort, ok := errors.AsType[*abortError](execErr); ok {
+		// A sub-agent keeps the mark, so that the delegation ends the run too.
+		if !a.scope.Main {
+			return nil, abort
+		}
 		return nil, abort.err
 	}
 	if interrupted || (execErr != nil && (ctx.Err() != nil || errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded))) {
@@ -249,7 +269,7 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 	if err != nil {
 		return nil, err
 	}
-	x.injector.add(input.CallID, refs)
+	a.injector.add(input.CallID, refs)
 	if execErr != nil {
 		slog.WarnContext(ctx, "einorun: tool call failed", "run_id", x.request.RunID, "tool", input.Name, "call_id", input.CallID, "error", execErr)
 		x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: call, Origin: OriginExecuted})
@@ -346,19 +366,24 @@ func (x *execution) finishWith(ctx context.Context, a *agent, input *compose.Too
 	})
 }
 
-// update changes the record of a call of agent a and writes it.
+// update changes the record of a call of agent a and writes it. A
+// sub-agent's failures are marked to end the run through the delegation.
 func (x *execution) update(ctx context.Context, a *agent, input *compose.ToolInput, change func(*ToolCall)) (ToolCall, error) {
 	if a.scope.Main {
 		return x.recorder.updateCall(ctx, input.CallID, change)
 	}
 	parent, ok := x.recorder.mainCall(a.parentCallID)
 	if !ok {
-		return ToolCall{}, errors.New("einorun: sub-agent call without its delegation call")
+		return ToolCall{}, &abortError{err: errors.New("einorun: sub-agent call without its delegation call")}
 	}
 	if _, exists := x.recorder.childPosition(parent.ID, input.CallID); !exists {
-		x.recorder.childStarted(a.parentCallID, input.Name, input.CallID, input.Arguments)
+		x.recorder.childStarted(a.parentCallID, a.modelCallOf(input.CallID), input.Name, input.CallID, input.Arguments)
 	}
-	return x.recorder.updateChild(ctx, parent.ID, input.CallID, change)
+	call, err := x.recorder.updateChild(ctx, parent.ID, input.CallID, change)
+	if err != nil {
+		return call, &abortError{err: err}
+	}
+	return call, nil
 }
 
 // applyPolicy applies a policy's trait overrides and notes.

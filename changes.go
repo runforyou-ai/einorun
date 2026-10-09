@@ -148,8 +148,8 @@ func (r *recorder) view(b Block) *stream.Block {
 	view := &stream.Block{ID: b.ID, Position: b.Position, ModelCallID: b.ModelCallID, Kind: stream.BlockKind(b.Kind), Text: b.Text}
 	if call := b.Call; call != nil {
 		view.Call = &stream.CallView{CallID: call.CallID, Name: call.Name, Status: string(call.Status), StartedAt: call.StartedAt, CompletedAt: call.CompletedAt}
-		if r.describe != nil {
-			view.Call.Description = r.describe(*call)
+		if entry, ok := r.tools[call.Name]; ok && entry.describe != nil {
+			view.Call.Description = entry.describe(call.Arguments)
 		}
 		view.Call.Activity = r.activity[call.ID]
 	}

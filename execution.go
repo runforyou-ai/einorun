@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/cloudwego/eino/adk"
-	"github.com/cloudwego/eino/adk/filesystem"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
@@ -93,8 +92,11 @@ type execution struct {
 	contextPolicy ContextPolicy
 	offloaded     *offloadStore
 	injector      *mediaInjector
-	summarizers   []*summarizer
+	summary       *summarizer       // the main agent's summarizer
+	agentsMu      sync.Mutex        // guards auxiliary and subUsage, which sub-agents add to
 	auxiliary     []*accountedModel // models the runtime calls besides the agents'
+	subUsage      llm.Usage         // usage of sub-agents
+	subagents     *subagentInstance // the Subagent extension of the run, if any
 
 	saveMu     sync.Mutex
 	context    []*schema.AgenticMessage // model context at the latest finalized output, without the system instruction
@@ -137,12 +139,15 @@ func (r *Runtime) assemble(ctx context.Context, request Request) (*execution, er
 	e.recorder.pub.start()
 	e.window = llm.ContextWindow(request.Model.ContextWindow)
 	e.contextPolicy = request.Context.withDefaults()
-	e.offloaded = &offloadStore{InMemoryBackend: filesystem.NewInMemoryBackend(), files: map[string]string{}}
-	e.offloaded.saved = func(ctx context.Context) error { return e.save(ctx) }
+	e.offloaded = newOffloadStore(func(ctx context.Context) error { return e.save(ctx) })
 	e.main = &agent{scope: AgentScope{Name: "main", Main: true}}
 
 	tools, completionTools, err := e.registerTools(ctx, e.main.scope)
 	if err != nil {
+		return e, err
+	}
+	// Every agent's context management adds the offload read tool.
+	if err := e.declareTool(OffloadReadTool, ToolSpec{Replayable: true, Retain: RetainIntact}, nil); err != nil {
 		return e, err
 	}
 	limit := request.Limits.Corrections
@@ -173,8 +178,12 @@ func (r *Runtime) assemble(ctx context.Context, request Request) (*execution, er
 	}
 	e.media.maxCount = mediaMaxCount(e.window)
 	e.retry = &modelRetry{runID: request.RunID, enabled: enabled, text: text}
-	e.injector = &mediaInjector{policy: e.media, inResult: request.Model.ToolResultMedia, text: text, pending: map[string][]MediaRef{}, injected: map[string]*schema.AgenticMessage{}}
+	e.injector = e.newInjector()
 	e.capture = &inputCapture{}
+	e.main.budget, e.main.injector, e.main.offloaded, e.main.retry = e.budget, e.injector, e.offloaded, e.retry
+	if err := e.bindBuiltins(ctx); err != nil {
+		return e, err
+	}
 
 	if request.Resume != nil {
 		restored, err := decodeState(request.Resume.State)
@@ -200,6 +209,7 @@ func (r *Runtime) assemble(ctx context.Context, request Request) (*execution, er
 	if err != nil {
 		return e, err
 	}
+	e.summary = e.main.summary
 	e.inputs = &inputs{feed: request.Feed, hold: e.completion.fixed}
 	return e, nil
 }
@@ -269,6 +279,35 @@ func (e *execution) loadExtensions(ctx context.Context) error {
 	return nil
 }
 
+// builtin is implemented by the runtime's own extensions, which work with
+// the execution directly.
+type builtin interface {
+	bind(ctx context.Context, e *execution) error
+}
+
+// bindBuiltins binds the runtime's own extensions, the Subagent extension
+// first so that skills can fork to it.
+func (e *execution) bindBuiltins(ctx context.Context) error {
+	var rest []builtin
+	for _, ext := range e.extensions.all {
+		switch b := ext.(type) {
+		case *subagentInstance:
+			e.subagents = b
+			if err := b.bind(ctx, e); err != nil {
+				return err
+			}
+		case builtin:
+			rest = append(rest, b)
+		}
+	}
+	for _, b := range rest {
+		if err := b.bind(ctx, e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // same reports whether two values are the same comparable value.
 func same(a, b any) bool {
 	if a == nil || b == nil {
@@ -278,53 +317,85 @@ func same(a, b any) bool {
 	return ta == tb && ta.Comparable() && a == b
 }
 
-// registerTools builds the tools of an agent and registers their entries; it
-// returns the tools and the sorted names of completion tools.
+// registerTools builds the tools of the main agent and registers their
+// entries; it returns the tools and the sorted names of completion tools.
 func (e *execution) registerTools(ctx context.Context, scope AgentScope) ([]tool.BaseTool, []string, error) {
-	var tools []tool.BaseTool
+	tools, releases, err := e.buildTools(ctx, scope)
+	e.releases = append(e.releases, releases...)
+	if err != nil {
+		return nil, nil, err
+	}
 	var completions []string
-	for _, spec := range e.request.Tools {
-		if spec.MainOnly && !scope.Main {
-			continue
-		}
-		item := spec.Tool
-		if spec.New != nil {
-			created, release, err := spec.New(ctx, scope)
-			if err != nil {
-				return nil, nil, err
-			}
-			if release != nil {
-				e.releases = append(e.releases, release)
-			}
-			item = created
-		}
-		info, err := item.Info(ctx)
+	for i, spec := range e.toolSpecs(scope) {
+		info, err := tools[i].Info(ctx)
 		if err != nil {
 			return nil, nil, fmt.Errorf("einorun: read tool info: %w", err)
 		}
-		if scope.Main {
-			if _, exists := e.recorder.tools[info.Name]; exists {
-				return nil, nil, fmt.Errorf("einorun: tool %s is registered twice", info.Name)
-			}
-			e.recorder.tools[info.Name] = &toolEntry{spec: spec, name: info.Name}
-			if spec.Completion {
-				completions = append(completions, info.Name)
-			}
+		if _, exists := e.recorder.tools[info.Name]; exists {
+			return nil, nil, fmt.Errorf("einorun: tool %s is registered twice", info.Name)
 		}
-		tools = append(tools, item)
+		e.recorder.tools[info.Name] = &toolEntry{spec: spec, name: info.Name}
+		if spec.Completion {
+			completions = append(completions, info.Name)
+		}
 	}
 	slices.Sort(completions)
 	return tools, completions, nil
 }
 
+// toolSpecs returns the specs of the tools an agent uses; sub-agents get
+// neither MainOnly nor completion tools.
+func (e *execution) toolSpecs(scope AgentScope) []ToolSpec {
+	return slices.DeleteFunc(slices.Clone(e.request.Tools), func(spec ToolSpec) bool {
+		return !scope.Main && (spec.MainOnly || spec.Completion)
+	})
+}
+
+// buildTools builds the tools of an agent, in the order of toolSpecs, and
+// returns the functions that release them when the agent ends; on error the
+// releases of the tools built so far are returned too.
+func (e *execution) buildTools(ctx context.Context, scope AgentScope) ([]tool.BaseTool, []func(), error) {
+	var tools []tool.BaseTool
+	var releases []func()
+	for _, spec := range e.toolSpecs(scope) {
+		item := spec.Tool
+		if spec.New != nil {
+			created, release, err := spec.New(ctx, scope)
+			if err != nil {
+				return nil, releases, err
+			}
+			if release != nil {
+				releases = append(releases, release)
+			}
+			item = created
+		}
+		tools = append(tools, item)
+	}
+	return tools, releases, nil
+}
+
+// declareTool registers a tool an extension's middleware adds to the main
+// agent, so that its calls are recorded with the spec's traits.
+func (e *execution) declareTool(name string, spec ToolSpec, describe func(arguments string) string) error {
+	if _, exists := e.recorder.tools[name]; exists {
+		return fmt.Errorf("einorun: tool %s is registered twice", name)
+	}
+	e.recorder.tools[name] = &toolEntry{spec: spec, name: name, describe: describe}
+	return nil
+}
+
 // buildAgent creates an agent with the runtime's middlewares in their fixed
-// order and the extensions' after them.
+// order and the extensions' after them. The main agent's outputs are
+// recorded as the run's process; a sub-agent's outputs only count usage.
 func (e *execution) buildAgent(ctx context.Context, a *agent, instruction string, tools []tool.BaseTool, maxIterations int) (*adk.TypedChatModelAgent[*schema.AgenticMessage], error) {
 	chatModel, err := e.request.Model.New(ctx, llm.ModelOptions{MaxOutputTokens: e.request.Model.MaxOutputTokens})
 	if err != nil {
 		return nil, err
 	}
 	patch, err := newPatchHandler(ctx, e.text, func(callID string) (string, bool) {
+		if !a.scope.Main {
+			return "", false
+		}
 		result, ok := e.patched[callID]
 		return result, ok
 	})
@@ -342,7 +413,7 @@ func (e *execution) buildAgent(ctx context.Context, a *agent, instruction string
 	}
 	slices.Sort(keep)
 	slices.Sort(intact)
-	reduce, err := e.reductionHandlers(ctx, e.offloaded, keep, intact)
+	reduce, err := e.reductionHandlers(ctx, a.offloaded, keep, intact)
 	if err != nil {
 		return nil, err
 	}
@@ -351,14 +422,16 @@ func (e *execution) buildAgent(ctx context.Context, a *agent, instruction string
 		return nil, err
 	}
 	accounted := &accountedModel{AgenticModel: summaryModel}
+	e.agentsMu.Lock()
 	e.auxiliary = append(e.auxiliary, accounted)
+	e.agentsMu.Unlock()
 	var reservers []ContextReserver
 	for _, ext := range e.extensions.all {
 		if r, ok := ext.(ContextReserver); ok {
 			reservers = append(reservers, r)
 		}
 	}
-	summary, err := e.newSummarizer(ctx, accounted, func() int64 {
+	a.summary, err = e.newSummarizer(ctx, accounted, func() int64 {
 		var total int64
 		for _, r := range reservers {
 			total += int64(max(r.ReservedTokens(a.scope), 0))
@@ -368,13 +441,16 @@ func (e *execution) buildAgent(ctx context.Context, a *agent, instruction string
 	if err != nil {
 		return nil, err
 	}
-	e.summarizers = append(e.summarizers, summary)
-	handlers := slices.Concat([]adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]{e.recorder}, reduce,
-		[]adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]{&argumentsNormalizer{}, patch, summary, e.budget})
-	if len(e.completion.tools) > 0 {
+	var first adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage] = e.recorder
+	if !a.scope.Main {
+		first = a.recorder
+	}
+	handlers := slices.Concat([]adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]{first}, reduce,
+		[]adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]{&argumentsNormalizer{}, patch, a.summary, a.budget})
+	if a.scope.Main && len(e.completion.tools) > 0 {
 		handlers = append(handlers, e.completion)
 	}
-	handlers = append(handlers, e.injector, &observerMiddleware{scope: a.scope, observers: e.extensions.outputs})
+	handlers = append(handlers, a.injector, &observerMiddleware{scope: a.scope, observers: e.extensions.outputs})
 	var outer, inner []compose.ToolMiddleware
 	for _, ext := range e.extensions.all {
 		if m, ok := ext.(ModelMiddleware); ok {
@@ -410,12 +486,18 @@ func (e *execution) buildAgent(ctx context.Context, a *agent, instruction string
 		}},
 		Handlers:         handlers,
 		MaxIterations:    maxIterations,
-		ModelRetryConfig: e.retry.config(),
+		ModelRetryConfig: a.retry.config(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("einorun: create agent %s: %w", a.scope.Name, err)
 	}
 	return built, nil
+}
+
+// newInjector returns a media injector for an agent, sharing the run's media
+// policy and budget.
+func (e *execution) newInjector() *mediaInjector {
+	return &mediaInjector{policy: e.media, inResult: e.request.Model.ToolResultMedia, text: e.text, pending: map[string][]MediaRef{}, injected: map[string]*schema.AgenticMessage{}}
 }
 
 // close releases tools, stops the stream and closes extensions.
@@ -529,7 +611,7 @@ func (e *execution) genInput(ctx context.Context, _ *adk.TurnLoop[trigger, *sche
 			e.history.messages = withoutMedia(e.history.messages, e.text)
 		}
 		messages = e.history.appendInput(ctx, trimHistory(ctx, claim.Messages, e.window), e.media)
-		e.summarizers[0].keepFrom(messages[len(messages)-1])
+		e.summary.keepFrom(messages[len(messages)-1])
 	case e.correction != "" || len(e.rejected) > 0:
 		if !e.media.enabled.Load() {
 			e.history.messages = withoutMedia(e.history.messages, e.text)
@@ -745,9 +827,12 @@ func (e *execution) afterToolCalls(ctx context.Context) error {
 func (e *execution) totalUsage() llm.Usage {
 	total := e.recorder.modelUsage()
 	total.Add(e.retry.discarded())
+	e.agentsMu.Lock()
+	defer e.agentsMu.Unlock()
 	for _, m := range e.auxiliary {
 		total.Add(m.used())
 	}
+	total.Add(e.subUsage)
 	for _, u := range e.extensions.usages {
 		total.Add(u.Usage())
 	}
@@ -758,15 +843,17 @@ func (e *execution) totalUsage() llm.Usage {
 func (e *execution) save(ctx context.Context) error {
 	e.saveMu.Lock()
 	defer e.saveMu.Unlock()
-	encoded, err := e.encodeState()
+	plan := e.recorder.currentPlan()
+	encoded, err := e.encodeState(&plan)
 	if err != nil {
 		return err
 	}
-	return e.recorder.saveStep(ctx, Step{Usage: e.totalUsage(), Plan: e.recorder.currentPlan(), Completion: e.completion.current(), State: encoded})
+	return e.recorder.saveStep(ctx, Step{Usage: e.totalUsage(), Plan: plan, Completion: e.completion.current(), State: encoded})
 }
 
-// encodeState encodes the checkpoint; the caller holds saveMu.
-func (e *execution) encodeState() ([]byte, error) {
+// encodeState encodes the checkpoint; the caller holds saveMu. A task list
+// replaces *plan with the plan of the state it saves, so that both agree.
+func (e *execution) encodeState(plan *[]PlanTask) ([]byte, error) {
 	messages, err := checkpoint.EncodeMessages(e.context)
 	if err != nil {
 		return nil, err
@@ -776,11 +863,17 @@ func (e *execution) encodeState() ([]byte, error) {
 		Version: checkpointVersion, Messages: messages, Seen: slices.Sorted(maps.Keys(e.history.seen)),
 		MediaEnabled: e.media.enabled.Load(), MediaPending: e.injector.pendingRefs(),
 		ClaimedSeq: e.inputs.boundary(), Turns: e.turns, Iterations: e.budget.count(), Corrections: used,
-		Completion: active, Usage: e.totalUsage(), KeepFromID: e.summarizers[0].keptFrom(), Offloaded: e.offloaded.snapshot(),
+		Completion: active, Usage: e.totalUsage(), KeepFromID: e.summary.keptFrom(), Offloaded: e.offloaded.snapshot(),
 	}
 	s.MediaCount, s.MediaBytes = e.media.budget.used()
 	for name, ext := range e.extensions.stateful {
-		data, err := ext.Save()
+		var data json.RawMessage
+		var err error
+		if p, ok := ext.(*planningInstance); ok {
+			data, *plan, err = p.snapshot()
+		} else {
+			data, err = ext.Save()
+		}
 		if err != nil {
 			return nil, fmt.Errorf("einorun: save extension %s: %w", name, err)
 		}
@@ -907,7 +1000,7 @@ func (e *execution) restore(ctx context.Context) (bool, error) {
 	e.media.enabled.Store(s.MediaEnabled)
 	e.budget.resume(s.Iterations)
 	e.completion.restore(s.Corrections, active)
-	e.summarizers[0].restoreKeepFrom(s.KeepFromID)
+	e.summary.restoreKeepFrom(s.KeepFromID)
 	if err := e.offloaded.restore(ctx, s.Offloaded); err != nil {
 		return false, err
 	}
@@ -989,8 +1082,18 @@ func (e *execution) finishRestored(ctx context.Context) error {
 // settleInterrupted settles calls that did not finish before the run
 // stopped, by their traits, and reports whether a main-agent call still waits
 // for an external result. Calls handed over or submitted stay with whoever
-// advances them; sub-agent calls never keep the run suspended.
+// advances them; sub-agent calls never keep the run suspended. A call whose
+// sub-agent started calls with side effects that cannot be repeated, or has
+// calls with pending external effects, needs review.
 func settleInterrupted(blocks []Block, children []ToolCall, at time.Time, text *prompt.Runtime) (changed []ToolCall, waiting bool) {
+	risky := map[string]bool{}
+	for _, c := range children {
+		pending := c.Handover != HandoverNone && !c.Status.Settled()
+		started := c.Status != StatusQueued
+		if pending || c.Status == StatusNeedsReview || (started && c.SideEffects && !c.Replayable) {
+			risky[c.ParentID] = true
+		}
+	}
 	settle := func(call *ToolCall, main bool) {
 		if call.Status.Settled() || call.Handover == HandoverDetached || call.Handover == HandoverSubmitted {
 			return
@@ -999,7 +1102,11 @@ func settleInterrupted(blocks []Block, children []ToolCall, at time.Time, text *
 			waiting = waiting || main
 			return
 		}
-		status, result := interrupted(call.Replayable, call.SideEffects, text)
+		replayable, sideEffects := call.Replayable, call.SideEffects
+		if main && risky[call.ID] {
+			replayable, sideEffects = false, true
+		}
+		status, result := interrupted(replayable, sideEffects, text)
 		call.Status, call.Result, call.CompletedAt = status, &result, &at
 		call.Rev++
 		changed = append(changed, call.Clone())

@@ -85,6 +85,10 @@ type modelRetry struct {
 	enabled *atomic.Bool
 	text    *prompt.Runtime
 
+	// discard, when set, takes the usage of discarded outputs in place of
+	// the retry's own count.
+	discard func(llm.Usage)
+
 	mu      sync.Mutex
 	retries int
 	usage   llm.Usage
@@ -126,7 +130,11 @@ func (m *modelRetry) shouldRetry(ctx context.Context, attempt *adk.TypedRetryCon
 		decision = &adk.TypedRetryDecision[*schema.AgenticMessage]{Retry: true}
 	}
 	if output != nil {
-		m.usage.Add(llm.UsageOf(output.ResponseMeta))
+		if m.discard != nil {
+			m.discard(llm.UsageOf(output.ResponseMeta))
+		} else {
+			m.usage.Add(llm.UsageOf(output.ResponseMeta))
+		}
 	}
 	return decision
 }
