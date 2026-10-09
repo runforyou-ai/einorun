@@ -29,6 +29,7 @@ Requires Go 1.27+.
 | [`llm`](https://pkg.go.dev/github.com/runforyou-ai/einorun/llm) | Model contract, single calls and structured output |
 | [`provider`](https://pkg.go.dev/github.com/runforyou-ai/einorun/provider) | Chat models, embeddings, rerank, model discovery and probes for major vendors |
 | [`stream`](https://pkg.go.dev/github.com/runforyou-ai/einorun/stream) | Live display stream of a run |
+| [`memory`](https://pkg.go.dev/github.com/runforyou-ai/einorun/memory) | Long-term memory: recall extension and extraction |
 | [`inmem`](https://pkg.go.dev/github.com/runforyou-ai/einorun/inmem) | In-memory `Feed` and `Journal` |
 | [`journaltest`](https://pkg.go.dev/github.com/runforyou-ai/einorun/journaltest) | Contract suites for your `Feed` and `Journal` |
 

@@ -66,6 +66,7 @@ type extensionSet struct {
 	outputs  []OutputObserver
 	stateful map[string]Stateful
 	pins     []PinProvider
+	usages   []UsageReporter
 	closers  []Closer
 }
 
@@ -207,7 +208,7 @@ func (r *Runtime) assemble(ctx context.Context, request Request) (*execution, er
 func (e *execution) loadExtensions(ctx context.Context) error {
 	set := extensionSet{stateful: map[string]Stateful{}}
 	names := map[string]bool{}
-	run := RunScope{RunID: e.request.RunID, Language: e.language}
+	run := RunScope{RunID: e.request.RunID, Language: e.language, Model: e.request.Model.New}
 	for _, prototype := range e.request.Extensions {
 		instance := prototype
 		if factory, ok := prototype.(Instantiable); ok {
@@ -248,6 +249,9 @@ func (e *execution) loadExtensions(ctx context.Context) error {
 		}
 		if p, ok := instance.(PinProvider); ok {
 			set.pins = append(set.pins, p)
+		}
+		if u, ok := instance.(UsageReporter); ok {
+			set.usages = append(set.usages, u)
 		}
 	}
 	if set.guard == nil {
@@ -731,6 +735,9 @@ func (e *execution) totalUsage() llm.Usage {
 	total.Add(e.retry.discarded())
 	for _, m := range e.auxiliary {
 		total.Add(m.used())
+	}
+	for _, u := range e.extensions.usages {
+		total.Add(u.Usage())
 	}
 	return total
 }
