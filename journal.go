@@ -73,7 +73,8 @@ func RejectCall(reason string) error { return &CallRejection{Reason: reason} }
 //     authoritative; OverlayExternal describes them.
 //   - SaveToolCall that submits a call for a decision (Handover
 //     HandoverSubmitted) is where the host creates the submission, in the same
-//     transaction. It returns an error wrapping ErrCallRejected to refuse it.
+//     transaction. It returns an error wrapping ErrCallRejected to refuse it,
+//     and then must not have persisted the write.
 //     A host that notifies reviewers of calls needing review does so when the
 //     merged record newly reaches StatusNeedsReview, not because the incoming
 //     snapshot says so.

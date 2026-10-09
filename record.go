@@ -147,7 +147,9 @@ type ToolCall struct {
 	Payload    json.RawMessage
 	Completion *CallCompletion
 	// Notes are annotations by tool specs, guards and extensions. The runtime
-	// only adds or changes notes, so every snapshot carries all of them.
+	// only adds or changes notes, so every snapshot carries all of them; a
+	// newer snapshot replaces the stored notes as a whole, so hosts keep data
+	// of their own elsewhere.
 	Notes map[string]string
 }
 
