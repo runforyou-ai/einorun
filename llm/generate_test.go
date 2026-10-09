@@ -109,6 +109,18 @@ func TestSchemaFor(t *testing.T) {
 	}
 }
 
+func TestSchemaForAnonymous(t *testing.T) {
+	s := SchemaFor[struct {
+		A int `json:"a"`
+	}]()
+	if s.Name != "output" || s.Schema.Properties == nil {
+		t.Fatalf("schema %+v", s)
+	}
+	if _, ok := s.Schema.Properties.Get("a"); !ok {
+		t.Fatal("missing property")
+	}
+}
+
 func TestEstimateTokens(t *testing.T) {
 	if got := EstimateTokens("你好abcd"); got != 3 {
 		t.Fatalf("estimate %d", got)
