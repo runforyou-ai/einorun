@@ -546,6 +546,24 @@ configurable.
   Limits})` is
   one structured call returning `Changes{Saved, Deleted, Skipped}` and the
   usage; the host applies them. Default prompts use neutral wording.
+- `toolname`: `Namer.Name(namespace, identity, server, tool)` builds
+  `<namespace>__<server>__<tool>_<digest>`: at most 64 ASCII letters, digits
+  and underscores, starting with a letter or an underscore. The same
+  arguments give the same name; the digest of the server's stable identity
+  and the original tool name (hashed with the namespace, length-prefixed)
+  keeps names of different servers and tools apart when their words match. A
+  renamed server gets new names; hosts that keep names across runs pass a
+  label that does not change. Long words are cut so the tool keeps a
+  readable part. Transliteration (such as pinyin) is an optional function the
+  host provides.
+- `tools/web`: `web_search` and `web_fetch` over host-provided `Searcher` and
+  `Fetcher`; the package validates arguments (count, time range, http/https
+  addresses without user information, passed on normalized; which addresses
+  may be reached is the `Fetcher`'s decision) and fails calls as
+  unavailable when no service is provided; all of its model-facing text,
+  errors included, can be overridden.
+  `SearchSpec` and `FetchSpec` register them as replayable tools without side
+  effects.
 - The library's own model-facing text (cancellation, interruption, needs
   review, end of budget, batch violations, summary preamble, offload read-back,
   sub-agent description, structured retry, media that cannot be viewed, tool
