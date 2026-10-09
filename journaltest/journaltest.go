@@ -106,14 +106,59 @@ func load(t *testing.T, h JournalHarness) einorun.Resume {
 	return resume
 }
 
-// find returns the record of the call "a", which most journal tests use.
+// find returns the record of the call "a", which most journal tests use. It
+// checks that Load hands back the same record, as resuming would see it.
 func find(t *testing.T, h JournalHarness) einorun.ToolCall {
 	t.Helper()
 	call, ok := lookup(t, h, "a")
 	if !ok {
 		t.Fatal("call a not found")
 	}
+	resume := load(t, h)
+	var loaded *einorun.ToolCall
+	for _, block := range resume.Blocks {
+		if block.Call != nil && block.Call.ID == call.ID {
+			loaded = block.Call
+		}
+	}
+	for i := range resume.Calls {
+		if resume.Calls[i].ID == call.ID {
+			loaded = &resume.Calls[i]
+		}
+	}
+	if loaded == nil {
+		t.Fatal("call a is missing from Load")
+	}
+	if diff := differ(call, *loaded); diff != "" {
+		t.Fatalf("Load hands back a different record than Call: %s", diff)
+	}
 	return call
+}
+
+// differ names the first field in which a and b differ, or returns "".
+func differ(a, b einorun.ToolCall) string {
+	sameTime := func(x, y *time.Time) bool { return (x == nil) == (y == nil) && (x == nil || x.Equal(*y)) }
+	switch {
+	case a.Rev != b.Rev:
+		return "Rev"
+	case a.Status != b.Status:
+		return "Status"
+	case str(a.Result) != str(b.Result):
+		return "Result"
+	case str(a.Error) != str(b.Error):
+		return "Error"
+	case a.Handover != b.Handover:
+		return "Handover"
+	case string(a.Payload) != string(b.Payload):
+		return "Payload"
+	case a.Name != b.Name || a.Arguments != b.Arguments:
+		return "Name or Arguments"
+	case !maps.Equal(a.Notes, b.Notes):
+		return "Notes"
+	case !sameTime(a.StartedAt, b.StartedAt) || !sameTime(a.CompletedAt, b.CompletedAt):
+		return "times"
+	}
+	return ""
 }
 
 // lookup returns the stored record of id.
