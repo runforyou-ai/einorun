@@ -26,6 +26,7 @@ import (
 	"github.com/volcengine/volcengine-go-sdk/service/arkruntime/model/responses"
 	"google.golang.org/genai"
 
+	"github.com/runforyou-ai/einorun/internal/prompt"
 	"github.com/runforyou-ai/einorun/llm"
 	"github.com/runforyou-ai/einorun/provider/vendor"
 )
@@ -36,7 +37,12 @@ var ErrStructuredStream = errors.New("provider: structured output supports Gener
 
 // ChatConfig configures a chat model.
 type ChatConfig struct {
+	// Brand selects the vendor preset: endpoint normalization, thinking
+	// switches and the default protocol and structured-output strategy.
 	Brand vendor.Brand
+	// Protocol overrides the preset's protocol, for example to reach a vendor
+	// through an OpenAI-compatible gateway.
+	Protocol vendor.Protocol
 	// BaseURL is the vendor endpoint as configured; it is normalized with the
 	// brand's preset.
 	BaseURL string
@@ -44,12 +50,18 @@ type ChatConfig struct {
 	// Model is the vendor's model identifier.
 	Model           string
 	MaxOutputTokens int
-	// DisableThinking turns thinking off where the vendor offers a switch.
+	// DisableThinking turns thinking off on protocols with a known switch:
+	// DeepSeek, Qwen, Ark and compatible vendors whose preset lists thinking
+	// fields.
 	DisableThinking bool
 	// Output, when set, asks for a JSON object matching the schema.
 	Output *llm.OutputSchema
-	// Structured overrides the preset's structured-output strategy.
+	// Structured overrides the preset's structured-output strategy. A
+	// strategy the protocol cannot apply is an error.
 	Structured vendor.Structured
+	// Language selects model-facing text the adapter writes, such as the
+	// description of the forced output tool.
+	Language llm.Language
 	// Transport sends the model's HTTP requests. The default waits at most two
 	// minutes for response headers; the caller's context bounds the body.
 	// Redirects are never followed.
@@ -64,7 +76,9 @@ var defaultTransport = func() *http.Transport {
 }()
 
 // Factory returns an llm.ModelFactory that creates models from base with the
-// requested options applied.
+// requested options applied: a positive MaxOutputTokens replaces base's limit,
+// DisableThinking adds to base's, and Output is taken from the options only
+// (base.Output is ignored, so that agents can stream).
 func Factory(base ChatConfig) llm.ModelFactory {
 	return func(ctx context.Context, options llm.ModelOptions) (model.AgenticModel, error) {
 		config := base
@@ -72,19 +86,17 @@ func Factory(base ChatConfig) llm.ModelFactory {
 			config.MaxOutputTokens = options.MaxOutputTokens
 		}
 		config.DisableThinking = config.DisableThinking || options.DisableThinking
-		if options.Output != nil {
-			config.Output = options.Output
-		}
+		config.Output = options.Output
 		return NewChatModel(ctx, config)
 	}
 }
 
-// NewChatModel creates the agentic chat model of config.Brand. Brands without
-// a dedicated component use the OpenAI-compatible one. With config.Output the
-// model is constrained by the brand's structured-output strategy; when the
-// vendor rejects the constraint with HTTP 400, the same Generate call is sent
-// again without it and the format relies on the instruction. The returned
-// model records normalized stop reasons with llm.SetStopReason.
+// NewChatModel creates the agentic chat model for config's protocol. With
+// config.Output the model is constrained by the structured-output strategy;
+// when the vendor rejects the constraint with HTTP 400, the same Generate call
+// is sent again without it and the format relies on the instruction. The
+// returned model records normalized stop reasons with llm.SetStopReason, on
+// Generate results and on streamed chunks.
 func NewChatModel(ctx context.Context, config ChatConfig) (model.AgenticModel, error) {
 	preset, known := vendor.Of(config.Brand)
 	if !known {
@@ -93,6 +105,20 @@ func NewChatModel(ctx context.Context, config ChatConfig) (model.AgenticModel, e
 	baseURL, err := preset.CompatibleURL(config.BaseURL)
 	if err != nil {
 		return nil, err
+	}
+	protocol := preset.Protocol
+	if config.Protocol != "" {
+		protocol = config.Protocol
+	}
+	mode := vendor.StructuredNone
+	if config.Output != nil {
+		mode = preset.Structured
+		if config.Structured != "" {
+			mode = config.Structured
+		}
+		if !protocol.Supports(mode) {
+			return nil, fmt.Errorf("provider: protocol %s cannot apply structured output %s", protocol, mode)
+		}
 	}
 	var plain model.AgenticModel
 	if config.Output != nil {
@@ -114,20 +140,13 @@ func NewChatModel(ctx context.Context, config ChatConfig) (model.AgenticModel, e
 	if config.MaxOutputTokens > 0 {
 		maxTokens = &config.MaxOutputTokens
 	}
-	if preset.RequiresMaxOutputTokens && maxTokens == nil {
-		return nil, fmt.Errorf("provider: %s requires max output tokens", config.Brand)
-	}
-	mode := vendor.StructuredNone
-	if config.Output != nil {
-		mode = preset.Structured
-		if config.Structured != "" {
-			mode = config.Structured
-		}
+	if protocol == vendor.ProtocolAnthropic && maxTokens == nil {
+		return nil, fmt.Errorf("provider: protocol %s requires max output tokens", protocol)
 	}
 	format := responseFormat(mode, config.Output)
 	var m model.AgenticModel
-	switch config.Brand {
-	case vendor.DeepSeek:
+	switch protocol {
+	case vendor.ProtocolDeepSeek:
 		c := &agenticdeepseek.Config{APIKey: config.APIKey, BaseURL: baseURL, Model: config.Model, MaxTokens: maxTokens, HTTPClient: client}
 		if mode == vendor.StructuredJSONObject {
 			c.ResponseFormatType = agenticdeepseek.ResponseFormatTypeJSONObject
@@ -140,16 +159,18 @@ func NewChatModel(ctx context.Context, config ChatConfig) (model.AgenticModel, e
 				openai.WithExtraFields(map[string]any{"thinking": map[string]any{"type": "disabled"}}),
 			}}
 		}
-	case vendor.Alibaba:
+	case vendor.ProtocolQwen:
 		c := &agenticqwen.Config{APIKey: config.APIKey, BaseURL: baseURL, Model: config.Model, MaxTokens: maxTokens, HTTPClient: client}
-		// The component's thinking switch overrides extra fields, so with a
-		// response format the switch travels in the extra fields too.
+		// The component's thinking switch replaces the extra fields, so with a
+		// response format the switch travels in the extra fields too, in both
+		// places the component itself would put it.
 		fields := map[string]any{}
 		switch {
 		case format != nil:
 			fields["response_format"] = format
 			if config.DisableThinking {
 				fields["enable_thinking"] = false
+				fields["chat_template_kwargs"] = map[string]any{"enable_thinking": false}
 			}
 		case config.DisableThinking:
 			c.EnableThinking = new(false)
@@ -158,20 +179,17 @@ func NewChatModel(ctx context.Context, config ChatConfig) (model.AgenticModel, e
 		if err == nil && len(fields) > 0 {
 			m = &requestOptions{AgenticModel: m, options: []model.Option{openai.WithExtraFields(fields)}}
 		}
-	case vendor.Volcengine:
+	case vendor.ProtocolArk:
 		c := &agenticark.Config{APIKey: config.APIKey, BaseURL: baseURL, Model: config.Model, MaxTokens: maxTokens, HTTPClient: client}
 		if config.DisableThinking {
 			c.Thinking = &responses.ResponsesThinking{Type: responses.ThinkingType_disabled.Enum()}
 		}
 		m, err = agenticark.New(ctx, c)
-	case vendor.Anthropic:
+	case vendor.ProtocolAnthropic:
 		m, err = agenticclaude.New(ctx, &agenticclaude.Config{
 			APIKey: config.APIKey, BaseURL: baseURL, Model: config.Model, MaxTokens: config.MaxOutputTokens, HTTPClient: client,
 		})
-		if err == nil && mode == vendor.StructuredForcedTool {
-			m = &forcedTool{AgenticModel: m, output: config.Output}
-		}
-	case vendor.Google:
+	case vendor.ProtocolGemini:
 		var gc *genai.Client
 		gc, err = genai.NewClient(ctx, &genai.ClientConfig{
 			APIKey: config.APIKey, Backend: genai.BackendGeminiAPI, HTTPClient: client,
@@ -185,14 +203,14 @@ func NewChatModel(ctx context.Context, config ChatConfig) (model.AgenticModel, e
 			c.ResponseJSONSchema = config.Output.Schema
 		}
 		m, err = agenticgemini.New(ctx, c)
-	case vendor.OpenAI:
+	case vendor.ProtocolOpenAI:
 		c := &agenticopenai.ChatConfig{APIKey: config.APIKey, BaseURL: baseURL, Model: config.Model, MaxCompletionTokens: maxTokens, HTTPClient: client}
 		if format != nil {
 			c.ExtraFields = map[string]any{"response_format": format}
 		}
 		m, err = agenticopenai.NewChatModel(ctx, c)
-	default:
-		// Other OpenAI-compatible vendors limit output with max_tokens in the
+	case vendor.ProtocolCompatible:
+		// OpenAI-compatible vendors limit output with max_tokens in the
 		// request body.
 		c := &agenticopenai.ChatConfig{APIKey: config.APIKey, BaseURL: baseURL, Model: config.Model, HTTPClient: client, ExtraFields: map[string]any{}}
 		if maxTokens != nil {
@@ -205,9 +223,14 @@ func NewChatModel(ctx context.Context, config ChatConfig) (model.AgenticModel, e
 			maps.Copy(c.ExtraFields, preset.DisableThinkingFields)
 		}
 		m, err = agenticopenai.NewChatModel(ctx, c)
+	default:
+		return nil, fmt.Errorf("provider: unknown protocol %q", protocol)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("provider: create %s model: %w", config.Brand, err)
+	}
+	if mode == vendor.StructuredForcedTool {
+		m = &forcedTool{AgenticModel: m, output: config.Output, description: prompt.For(string(config.Language)).ForcedToolDescription}
 	}
 	return &observed{AgenticModel: m, plain: plain, brand: config.Brand, model: config.Model}, nil
 }
@@ -245,12 +268,13 @@ func responseFormat(mode vendor.Structured, output *llm.OutputSchema) map[string
 // turns the tool's arguments into text.
 type forcedTool struct {
 	model.AgenticModel
-	output *llm.OutputSchema
+	output      *llm.OutputSchema
+	description string
 }
 
 // Generate forces the output tool and returns its arguments as text.
 func (m *forcedTool) Generate(ctx context.Context, input []*schema.AgenticMessage, opts ...model.Option) (*schema.AgenticMessage, error) {
-	info := &schema.ToolInfo{Name: m.output.Name, Desc: "Submit the output in the required structure", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(m.output.Schema)}
+	info := &schema.ToolInfo{Name: m.output.Name, Desc: m.description, ParamsOneOf: schema.NewParamsOneOfByJSONSchema(m.output.Schema)}
 	choice := &schema.AgenticToolChoice{Type: schema.ToolChoiceForced, Forced: &schema.AgenticForcedToolChoice{Tools: []*schema.AllowedTool{{FunctionName: m.output.Name}}}}
 	message, err := m.AgenticModel.Generate(ctx, input, append([]model.Option{model.WithTools([]*schema.ToolInfo{info}), model.WithAgenticToolChoice(choice)}, opts...)...)
 	if err != nil {
@@ -271,7 +295,8 @@ func (m *forcedTool) Stream(context.Context, []*schema.AgenticMessage, ...model.
 	return nil, ErrStructuredStream
 }
 
-// stopReason derives the stop reason from component-specific extensions.
+// stopReason derives a stop reason other than StopCompleted from
+// component-specific extensions.
 func stopReason(message *schema.AgenticMessage) (llm.StopReason, bool) {
 	if message == nil || message.ResponseMeta == nil {
 		return "", false
@@ -295,5 +320,6 @@ func stopReason(message *schema.AgenticMessage) (llm.StopReason, bool) {
 	default:
 		return "", false
 	}
-	return llm.NormalizeStopReason(strings.TrimSpace(reason)), true
+	normalized := llm.NormalizeStopReason(strings.TrimSpace(reason))
+	return normalized, normalized != llm.StopCompleted
 }

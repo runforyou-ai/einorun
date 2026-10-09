@@ -126,20 +126,37 @@ func (m *observed) Generate(ctx context.Context, input []*schema.AgenticMessage,
 			OpenAIExtension: &schemaopenai.AssistantGenTextExtension{Refusal: &schemaopenai.OutputRefusal{Reason: ex.refusal}},
 		}))
 	}
-	if reason, ok := stopReason(&result); ok && llm.StopReasonOf(&result) == llm.StopCompleted {
-		result.Extra = cloneExtra(result.Extra)
-		llm.SetStopReason(&result, reason)
-	}
-	return &result, nil
+	return withStopReason(&result), nil
 }
 
-// Stream streams the output; models created for structured output only
-// support Generate.
+// withStopReason returns message with the stop reason its component reported
+// in a component-specific extension recorded for llm.StopReasonOf. Only
+// reasons other than StopCompleted are recorded, so a message carries the
+// key at most once even after stream chunks are concatenated.
+func withStopReason(message *schema.AgenticMessage) *schema.AgenticMessage {
+	reason, ok := stopReason(message)
+	if !ok || llm.StopReasonOf(message) != llm.StopCompleted {
+		return message
+	}
+	marked := *message
+	marked.Extra = cloneExtra(message.Extra)
+	llm.SetStopReason(&marked, reason)
+	return &marked
+}
+
+// Stream streams the output and records stop reasons on the chunks that
+// report them; models created for structured output only support Generate.
 func (m *observed) Stream(ctx context.Context, input []*schema.AgenticMessage, opts ...model.Option) (*schema.StreamReader[*schema.AgenticMessage], error) {
 	if m.plain != nil {
 		return nil, ErrStructuredStream
 	}
-	return m.AgenticModel.Stream(ctx, input, opts...)
+	stream, err := m.AgenticModel.Stream(ctx, input, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return schema.StreamReaderWithConvert(stream, func(chunk *schema.AgenticMessage) (*schema.AgenticMessage, error) {
+		return withStopReason(chunk), nil
+	}), nil
 }
 
 // cloneExtra copies extra so that recording a stop reason does not change the

@@ -7,6 +7,7 @@ package vendor
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"strings"
 )
@@ -36,10 +37,53 @@ const (
 	OpenAICompatible Brand = "openai_compatible"
 )
 
-// Brands lists every supported brand.
-var Brands = []Brand{
-	OpenAI, Anthropic, Google, DeepSeek, Alibaba, Moonshot, Zhipu, Volcengine,
-	MiniMax, XAI, Mistral, OpenRouter, TypeSafe, Ollama, OpenAICompatible,
+// Brands returns every supported brand.
+func Brands() []Brand {
+	return []Brand{
+		OpenAI, Anthropic, Google, DeepSeek, Alibaba, Moonshot, Zhipu, Volcengine,
+		MiniMax, XAI, Mistral, OpenRouter, TypeSafe, Ollama, OpenAICompatible,
+	}
+}
+
+// Protocol is the API a chat model speaks, which decides the component used.
+type Protocol string
+
+// Chat protocols.
+const (
+	// ProtocolOpenAI is OpenAI's Chat Completions API (max_completion_tokens).
+	ProtocolOpenAI Protocol = "openai"
+	// ProtocolCompatible is an OpenAI-compatible Chat Completions API
+	// (max_tokens, vendor fields in the request body).
+	ProtocolCompatible Protocol = "compatible"
+	// ProtocolDeepSeek is DeepSeek's API.
+	ProtocolDeepSeek Protocol = "deepseek"
+	// ProtocolQwen is Alibaba DashScope's compatible mode.
+	ProtocolQwen Protocol = "qwen"
+	// ProtocolArk is Volcengine Ark's Responses API.
+	ProtocolArk Protocol = "ark"
+	// ProtocolAnthropic is Anthropic's Messages API; every request needs an
+	// output limit.
+	ProtocolAnthropic Protocol = "anthropic"
+	// ProtocolGemini is Google's Gemini API.
+	ProtocolGemini Protocol = "gemini"
+)
+
+// Supports reports whether the protocol can apply the structured-output
+// strategy s. StructuredNone is always supported.
+func (p Protocol) Supports(s Structured) bool {
+	switch s {
+	case StructuredNone:
+		return true
+	case StructuredJSONSchema:
+		return p == ProtocolOpenAI || p == ProtocolCompatible || p == ProtocolQwen
+	case StructuredJSONObject:
+		return p == ProtocolOpenAI || p == ProtocolCompatible || p == ProtocolQwen || p == ProtocolDeepSeek
+	case StructuredForcedTool:
+		return p == ProtocolOpenAI || p == ProtocolCompatible || p == ProtocolQwen || p == ProtocolDeepSeek || p == ProtocolAnthropic
+	case StructuredGemini:
+		return p == ProtocolGemini
+	}
+	return false
 }
 
 // Structured is how a vendor constrains a model to produce a JSON object.
@@ -73,12 +117,11 @@ const (
 // Preset is what einorun knows about a brand.
 type Preset struct {
 	Brand Brand
+	// Protocol is the API the brand's endpoints speak by default.
+	Protocol Protocol
 	// compatiblePath rewrites the endpoint path (without a trailing slash) to
 	// the OpenAI-compatible entry point; nil keeps it.
 	compatiblePath func(path string) string
-	// RequiresMaxOutputTokens means every chat request must carry an output
-	// limit.
-	RequiresMaxOutputTokens bool
 	// DisableThinkingFields are added to the request body of OpenAI-compatible
 	// requests to turn thinking off.
 	DisableThinkingFields map[string]any
@@ -94,11 +137,12 @@ type Preset struct {
 }
 
 var presets = map[Brand]Preset{
-	OpenAI:    {Structured: StructuredJSONSchema},
-	Anthropic: {Structured: StructuredForcedTool, RequiresMaxOutputTokens: true},
-	Google:    {Structured: StructuredGemini},
-	DeepSeek:  {Structured: StructuredJSONObject},
+	OpenAI:    {Protocol: ProtocolOpenAI, Structured: StructuredJSONSchema},
+	Anthropic: {Protocol: ProtocolAnthropic, Structured: StructuredForcedTool},
+	Google:    {Protocol: ProtocolGemini, Structured: StructuredGemini},
+	DeepSeek:  {Protocol: ProtocolDeepSeek, Structured: StructuredJSONObject},
 	Alibaba: {
+		Protocol:   ProtocolQwen,
 		Structured: StructuredJSONObject,
 		Rerank:     RerankDashScope,
 		compatiblePath: func(path string) string {
@@ -114,7 +158,7 @@ var presets = map[Brand]Preset{
 	},
 	Moonshot:   {Structured: StructuredJSONObject},
 	Zhipu:      {Structured: StructuredJSONObject, DisableThinkingFields: map[string]any{"thinking": map[string]any{"type": "disabled"}}},
-	Volcengine: {},
+	Volcengine: {Protocol: ProtocolArk},
 	MiniMax:    {},
 	XAI:        {Structured: StructuredJSONSchema},
 	Mistral:    {Structured: StructuredJSONSchema},
@@ -130,10 +174,15 @@ var presets = map[Brand]Preset{
 	OpenAICompatible: {Discovery: true, CredentialsOptional: true},
 }
 
-// Of returns the preset of brand and whether the brand is known.
+// Of returns the preset of brand and whether the brand is known. The preset
+// is a copy the caller may change.
 func Of(brand Brand) (Preset, bool) {
 	preset, ok := presets[brand]
 	preset.Brand = brand
+	preset.DisableThinkingFields = maps.Clone(preset.DisableThinkingFields)
+	if preset.Protocol == "" {
+		preset.Protocol = ProtocolCompatible
+	}
 	if preset.Structured == "" {
 		preset.Structured = StructuredNone
 	}

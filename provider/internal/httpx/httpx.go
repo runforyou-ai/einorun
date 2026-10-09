@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/runforyou-ai/einorun/provider/apierr"
@@ -54,11 +55,13 @@ func Call(ctx context.Context, client Doer, request Request, output any) error {
 func Do(ctx context.Context, client Doer, request Request) ([]byte, error) {
 	var reader io.Reader
 	if request.JSON != nil {
-		encoded, err := json.Marshal(request.JSON)
-		if err != nil {
+		var encoded bytes.Buffer
+		encoder := json.NewEncoder(&encoded)
+		encoder.SetEscapeHTML(false)
+		if err := encoder.Encode(request.JSON); err != nil {
 			return nil, err
 		}
-		reader = bytes.NewReader(encoded)
+		reader = &encoded
 	}
 	method := request.Method
 	if method == "" {
@@ -80,10 +83,7 @@ func Do(ctx context.Context, client Doer, request Request) ([]byte, error) {
 	}
 	response, err := client.Do(req)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, apierr.FromTransport(err)
+		return nil, transportError(ctx, err)
 	}
 	defer func() { _ = response.Body.Close() }()
 	limit := request.MaxBytes
@@ -92,10 +92,7 @@ func Do(ctx context.Context, client Doer, request Request) ([]byte, error) {
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, apierr.FromTransport(err)
+		return nil, transportError(ctx, err)
 	}
 	if int64(len(body)) > limit {
 		return nil, apierr.New(apierr.StageCapability, apierr.Protocol, errors.New("response too large"))
@@ -104,6 +101,28 @@ func Do(ctx context.Context, client Doer, request Request) ([]byte, error) {
 		return nil, apierr.FromStatus(response.StatusCode, excerpt(body))
 	}
 	return body, nil
+}
+
+// transportError returns cancellation by the caller unchanged and classifies
+// everything else, including the caller's deadline, with apierr.
+func transportError(ctx context.Context, err error) error {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return ctx.Err()
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return apierr.New(apierr.StageConnect, apierr.Timeout, context.DeadlineExceeded)
+	}
+	return apierr.FromTransport(err)
+}
+
+// NewClient returns an HTTP client that never follows redirects, so that
+// credentials are only ever sent to the configured endpoint, with the given
+// timeout per request.
+func NewClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout:       timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 // excerpt returns the start of body as valid UTF-8 text.

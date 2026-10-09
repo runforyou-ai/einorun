@@ -45,9 +45,10 @@ type Client struct {
 	HTTP httpx.Doer
 }
 
-// NewClient returns a client with a five-minute timeout per request.
+// NewClient returns a client with a five-minute timeout per request that
+// never follows redirects.
 func NewClient() *Client {
-	return &Client{HTTP: &http.Client{Timeout: 5 * time.Minute}}
+	return &Client{HTTP: httpx.NewClient(5 * time.Minute)}
 }
 
 // Embed creates a vector of dimension for each input, in batches of BatchSize.

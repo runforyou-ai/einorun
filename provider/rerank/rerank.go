@@ -44,9 +44,10 @@ type Client struct {
 	HTTP httpx.Doer
 }
 
-// NewClient returns a client with a one-minute timeout per request.
+// NewClient returns a client with a one-minute timeout per request that never
+// follows redirects.
 func NewClient() *Client {
-	return &Client{HTTP: &http.Client{Timeout: time.Minute}}
+	return &Client{HTTP: httpx.NewClient(time.Minute)}
 }
 
 // Rerank scores documents against query and returns at most topN scores.

@@ -8,7 +8,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/runforyou-ai/einorun/llm"
 	"github.com/runforyou-ai/einorun/provider/apierr"
@@ -22,9 +25,12 @@ import (
 // serve answers requests by path; it records the request bodies and headers.
 func serve(t *testing.T, routes map[string]func(body map[string]any) (int, any)) (*httptest.Server, *[]*http.Request) {
 	t.Helper()
+	var mu sync.Mutex
 	var requests []*http.Request
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		requests = append(requests, r)
+		mu.Unlock()
 		route, ok := routes[r.URL.Path]
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
@@ -171,5 +177,52 @@ func TestDiscovery(t *testing.T) {
 	}
 	if _, err := discovery.Discover(ctx, nil, discovery.Endpoint{Brand: vendor.Anthropic, BaseURL: ts.URL}); !errors.Is(err, discovery.ErrUnsupported) {
 		t.Fatalf("unsupported: %v", err)
+	}
+}
+
+func TestDeadlineIsTimeout(t *testing.T) {
+	release := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer ts.Close()
+	defer close(release)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := embedding.NewClient().Embed(ctx, embedding.Endpoint{BaseURL: ts.URL}, "m", 2, []string{"a"})
+	if classified, ok := apierr.As(err); !ok || classified.Kind != apierr.Timeout {
+		t.Fatalf("deadline: %v", err)
+	}
+	canceled, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	if _, err := embedding.NewClient().Embed(canceled, embedding.Endpoint{BaseURL: ts.URL}, "m", 2, []string{"a"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel: %v", err)
+	}
+}
+
+func TestRedirectsAreNotFollowed(t *testing.T) {
+	var followed bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { followed = true }))
+	defer target.Close()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusFound)
+	}))
+	defer ts.Close()
+	err := probe.Run(context.Background(), nil, probe.Endpoint{Brand: vendor.Anthropic, BaseURL: ts.URL, APIKey: "k"})
+	if followed || err == nil {
+		t.Fatalf("redirect followed %v err %v", followed, err)
+	}
+	if _, err := discovery.Discover(context.Background(), nil, discovery.Endpoint{Brand: vendor.OpenAICompatible, BaseURL: ts.URL}); followed || err == nil {
+		t.Fatalf("discovery followed %v err %v", followed, err)
+	}
+}
+
+func TestTransportErrorsHideCredentials(t *testing.T) {
+	_, err := embedding.NewClient().Embed(context.Background(), embedding.Endpoint{BaseURL: "http://user:secret@127.0.0.1:1/v1?key=secret"}, "m", 2, []string{"a"})
+	if err == nil || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("error %v", err)
 	}
 }

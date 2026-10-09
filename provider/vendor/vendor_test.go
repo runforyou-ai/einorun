@@ -32,17 +32,22 @@ func TestCompatibleURL(t *testing.T) {
 }
 
 func TestPresets(t *testing.T) {
-	for _, brand := range Brands {
+	for _, brand := range Brands() {
 		preset, ok := Of(brand)
-		if !ok || preset.Structured == "" || preset.Rerank == "" {
+		if !ok || preset.Structured == "" || preset.Rerank == "" || !preset.Protocol.Supports(preset.Structured) {
 			t.Fatalf("%s: %+v", brand, preset)
 		}
 	}
 	if _, ok := Of("unknown"); ok {
 		t.Fatal("unknown brand reported as known")
 	}
-	if p, _ := Of(Anthropic); !p.RequiresMaxOutputTokens || p.Structured != StructuredForcedTool {
+	if p, _ := Of(Anthropic); p.Protocol != ProtocolAnthropic || p.Structured != StructuredForcedTool {
 		t.Fatalf("anthropic %+v", p)
+	}
+	p, _ := Of(Zhipu)
+	p.DisableThinkingFields["x"] = 1
+	if again, _ := Of(Zhipu); again.DisableThinkingFields["x"] != nil {
+		t.Fatal("preset shares its map")
 	}
 }
 

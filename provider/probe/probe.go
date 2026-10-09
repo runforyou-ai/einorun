@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/runforyou-ai/einorun/provider/apierr"
 	"github.com/runforyou-ai/einorun/provider/internal/httpx"
@@ -22,11 +23,15 @@ type Endpoint struct {
 	APIKey  string
 }
 
+// DefaultTimeout bounds a probe made with the default client.
+const DefaultTimeout = 30 * time.Second
+
 // Run sends the brand's read-only request and validates the minimal shape of
-// the response. Failures are classified with apierr.
+// the response. Failures are classified with apierr. A nil client means one
+// that never follows redirects and times out after DefaultTimeout.
 func Run(ctx context.Context, client httpx.Doer, endpoint Endpoint) error {
 	if client == nil {
-		client = http.DefaultClient
+		client = httpx.NewClient(DefaultTimeout)
 	}
 	request := httpx.Request{APIKey: endpoint.APIKey}
 	var validate func([]byte) error

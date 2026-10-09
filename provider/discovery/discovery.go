@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/runforyou-ai/einorun/llm"
 	"github.com/runforyou-ai/einorun/provider/apierr"
@@ -55,11 +56,15 @@ var ErrUnsupported = errors.New("discovery: brand does not support model discove
 // ollamaDetailConcurrency bounds concurrent Ollama detail requests.
 const ollamaDetailConcurrency = 4
 
+// DefaultTimeout bounds each request made with the default client.
+const DefaultTimeout = time.Minute
+
 // Discover reads the models of endpoint. Brands whose preset does not support
-// discovery fail with ErrUnsupported.
+// discovery fail with ErrUnsupported. A nil client means one that never
+// follows redirects and times out after DefaultTimeout.
 func Discover(ctx context.Context, client httpx.Doer, endpoint Endpoint) ([]Model, error) {
 	if client == nil {
-		client = http.DefaultClient
+		client = httpx.NewClient(DefaultTimeout)
 	}
 	switch endpoint.Brand {
 	case vendor.Ollama:

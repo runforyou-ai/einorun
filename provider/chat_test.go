@@ -32,6 +32,17 @@ func (c *completions) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	c.requests = append(c.requests, body)
 	c.mu.Unlock()
+	if body["stream"] == true {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, chunk := range []string{
+			`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"part"}}]}`,
+			`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`,
+		} {
+			_, _ = io.WriteString(w, "data: "+chunk+"\n\n")
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		return
+	}
 	status, response := c.reply(body)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -167,6 +178,17 @@ func TestConfigErrors(t *testing.T) {
 		!strings.Contains(err.Error(), "max output tokens") {
 		t.Fatalf("anthropic without max tokens: %v", err)
 	}
+	for _, c := range []ChatConfig{
+		{Brand: vendor.Volcengine, Structured: vendor.StructuredJSONSchema},
+		{Brand: vendor.Google, Structured: vendor.StructuredJSONObject},
+		{Brand: vendor.DeepSeek, Structured: vendor.StructuredJSONSchema},
+		{Brand: vendor.OpenAI, Protocol: "nope"},
+	} {
+		c.BaseURL, c.Model, c.MaxOutputTokens, c.Output = "https://example.com", "m", 10, llm.SchemaFor[struct{}]()
+		if _, err := NewChatModel(context.Background(), c); err == nil {
+			t.Fatalf("accepted %s %s %s", c.Brand, c.Protocol, c.Structured)
+		}
+	}
 	if _, err := NewChatModel(context.Background(), ChatConfig{Brand: "nope", BaseURL: "https://example.com"}); err == nil {
 		t.Fatal("unknown brand accepted")
 	}
@@ -182,5 +204,86 @@ func TestStructuredModelsDoNotStream(t *testing.T) {
 	}
 	if _, err := m.Stream(context.Background(), nil); !errors.Is(err, ErrStructuredStream) {
 		t.Fatalf("stream: %v", err)
+	}
+}
+
+func TestStreamStopReason(t *testing.T) {
+	ts := httptest.NewServer(&completions{})
+	defer ts.Close()
+	m, err := NewChatModel(context.Background(), ChatConfig{Brand: vendor.OpenAICompatible, BaseURL: ts.URL, Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := m.Stream(context.Background(), []*schema.AgenticMessage{schema.UserAgenticMessage("hi")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chunks []*schema.AgenticMessage
+	for {
+		chunk, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		chunks = append(chunks, chunk)
+	}
+	message, err := schema.ConcatAgenticMessages(chunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if llm.StopReasonOf(message) != llm.StopLength || llm.Text(message) != "part" {
+		t.Fatalf("stop %q text %q", llm.StopReasonOf(message), llm.Text(message))
+	}
+}
+
+func TestForcedToolOverCompatibleProtocol(t *testing.T) {
+	server := &completions{reply: func(map[string]any) (int, string) {
+		encoded, _ := json.Marshal(map[string]any{
+			"id": "c1", "object": "chat.completion", "created": 1, "model": "m",
+			"choices": []any{map[string]any{"index": 0, "finish_reason": "tool_calls", "message": map[string]any{
+				"role": "assistant", "content": "",
+				"tool_calls": []any{map[string]any{"id": "t1", "type": "function", "function": map[string]any{"name": "output", "arguments": `{"a":1}`}}},
+			}}},
+		})
+		return http.StatusOK, string(encoded)
+	}}
+	ts := httptest.NewServer(server)
+	defer ts.Close()
+	// An Anthropic model reached through an OpenAI-compatible gateway.
+	factory := Factory(ChatConfig{Brand: vendor.Anthropic, Protocol: vendor.ProtocolCompatible, BaseURL: ts.URL, Model: "m", Language: llm.Chinese})
+	message, err := ask(t, factory, llm.ModelOptions{Output: llm.SchemaFor[struct {
+		A int `json:"a"`
+	}]()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if llm.Text(message) != `{"a":1}` {
+		t.Fatalf("text %q", llm.Text(message))
+	}
+	body := server.requests[0]
+	tools, _ := body["tools"].([]any)
+	if len(tools) != 1 || body["tool_choice"] == nil {
+		t.Fatalf("tools %v choice %v", body["tools"], body["tool_choice"])
+	}
+	function := tools[0].(map[string]any)["function"].(map[string]any)
+	if function["description"] != "按要求的结构提交输出" {
+		t.Fatalf("description %v", function["description"])
+	}
+}
+
+func TestQwenStructuredWithoutThinking(t *testing.T) {
+	server := &completions{reply: func(map[string]any) (int, string) { return http.StatusOK, completion("{}", "stop", "") }}
+	ts := httptest.NewServer(server)
+	defer ts.Close()
+	factory := Factory(ChatConfig{Brand: vendor.Alibaba, BaseURL: ts.URL, Model: "m"})
+	if _, err := ask(t, factory, llm.ModelOptions{DisableThinking: true, Output: llm.SchemaFor[struct{}]()}); err != nil {
+		t.Fatal(err)
+	}
+	body := server.requests[0]
+	kwargs, _ := body["chat_template_kwargs"].(map[string]any)
+	if body["enable_thinking"] != false || kwargs["enable_thinking"] != false || body["response_format"] == nil {
+		t.Fatalf("body %v", body)
 	}
 }
