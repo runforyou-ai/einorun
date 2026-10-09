@@ -306,7 +306,10 @@ func TestMediaFollowsTheWholeBatch(t *testing.T) {
 	}
 }
 
-// failingSteps fails the step saved after an offload.
+// errDiskUnavailable is the save error of failingSteps.
+var errDiskUnavailable = errors.New("disk unavailable")
+
+// failingSteps fails the first step saved after an offload, once.
 type failingSteps struct {
 	*inmem.Journal
 	fail bool
@@ -314,7 +317,8 @@ type failingSteps struct {
 
 func (j *failingSteps) SaveStep(ctx context.Context, step einorun.Step) error {
 	if j.fail {
-		return errors.New("disk unavailable")
+		j.fail = false
+		return errDiskUnavailable
 	}
 	return j.Journal.SaveStep(ctx, step)
 }
@@ -330,7 +334,10 @@ func TestOffloadSaveFailureEndsTheRun(t *testing.T) {
 	}}
 	_, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory, ContextWindow: 4000}, Feed: feed, Journal: journal,
 		Tools: []einorun.ToolSpec{{Tool: dump}}})
-	if err == nil || !strings.Contains(err.Error(), "disk unavailable") {
+	if !errors.Is(err, errDiskUnavailable) {
 		t.Fatalf("err %v", err)
+	}
+	if len(m.inputs) != 1 {
+		t.Fatalf("model calls %d, want 1", len(m.inputs))
 	}
 }
