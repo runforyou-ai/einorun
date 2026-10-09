@@ -181,9 +181,13 @@ type Step struct {
   notes, steps and removals, block links and concurrent writes to one call.
   Every ID and model call ID it writes is a fresh UUIDv7, and payloads are
   compared as JSON values, so SQL journals with UUID and JSON columns run it
-  unchanged. The Feed suite compares claims with the message the host's
-  harness reports it stored, so feeds that derive messages from their own
-  records (assigning IDs, keeping only some fields) run it too.
+  unchanged; provider call IDs are unique per test and not UUIDs, main calls
+  have an empty `ParentID` (stored as NULL, read back empty), and an empty
+  payload must read back empty. The Feed suite compares claims with the
+  message the host's harness reports it stored, so feeds that derive
+  messages from their own records (assigning IDs and revisions, keeping only
+  some fields) run it too; distinct messages must keep distinct ID and
+  revision pairs, since the runtime deduplicates history by them.
 
 ### Ownership
 
@@ -586,7 +590,9 @@ configurable.
   unavailable, memory defaults, web tools) exists in Chinese and English and
   can be overridden: the runtime's text is the public `Text`, which
   `Config.Text` overrides field by field (`DefaultText` returns the defaults,
-  `Runtime.Text` the text in use). `Runtime.InterruptedOutcome` gives the
-  status and text the runtime uses for an interrupted call, for hosts that
-  settle calls outside a run. Receipts, completion tools and guard corrections
+  `Runtime.Text` the text in use); the text of `memory` and `tools/web` is
+  set through their options. `Runtime.InterruptedOutcome` gives the status
+  and text the runtime uses for a single interrupted call, for hosts that
+  settle calls outside a run; delegations whose sub-agent calls have pending
+  or unrepeatable effects are left to recovery. Receipts, completion tools and guard corrections
   are written by the host.

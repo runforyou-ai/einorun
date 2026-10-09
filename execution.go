@@ -388,7 +388,9 @@ func (e *execution) declareTool(name string, spec ToolSpec, describe func(argume
 			spec.Notes = map[string]string{}
 		}
 		maps.Copy(spec.Notes, adjust.Notes)
-		spec.Policy = adjust.Policy
+		if adjust.Policy != nil {
+			spec.Policy = adjust.Policy
+		}
 	}
 	e.recorder.tools[name] = &toolEntry{spec: spec, name: name, describe: describe, builtin: true}
 	return nil
@@ -399,7 +401,14 @@ func (e *execution) declareTool(name string, spec ToolSpec, describe func(argume
 func (e *execution) checkBuiltinTools() error {
 	for name := range e.request.BuiltinTools {
 		if entry, ok := e.recorder.tools[name]; !ok || !entry.builtin {
-			return fmt.Errorf("einorun: BuiltinTools names %s, which is not a built-in tool of the run", name)
+			var builtins []string
+			for n, entry := range e.recorder.tools {
+				if entry.builtin {
+					builtins = append(builtins, n)
+				}
+			}
+			slices.Sort(builtins)
+			return fmt.Errorf("einorun: BuiltinTools names %s, which is not a built-in tool of the run (built-in tools: %s)", name, strings.Join(builtins, ", "))
 		}
 	}
 	return nil

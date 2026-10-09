@@ -89,8 +89,14 @@ func TestParallelSubagentsHaveTheirOwnScope(t *testing.T) {
 	if result.Calls[0].ParentID == result.Calls[1].ParentID {
 		t.Fatal("parallel sub-agents share an ID")
 	}
-	if scopes.outputs[0] != einorun.MainAgentID {
-		t.Fatalf("outputs %v", scopes.outputs)
+	// The main agent's outputs and each sub-agent's outputs come with their
+	// own scope.
+	byAgent := map[string]int{}
+	for _, id := range scopes.outputs {
+		byAgent[id]++
+	}
+	if byAgent[einorun.MainAgentID] != 2 || byAgent[result.Calls[0].ParentID] != 2 || byAgent[result.Calls[1].ParentID] != 2 {
+		t.Fatalf("outputs by agent %v", byAgent)
 	}
 }
 
@@ -130,6 +136,12 @@ func TestUnknownBuiltinToolIsRefused(t *testing.T) {
 	_, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed,
 		Tools:        []einorun.ToolSpec{{Tool: echo("lookup")}},
 		BuiltinTools: map[string]einorun.BuiltinTool{"lookup": {}}})
+	if err == nil || !strings.Contains(err.Error(), "not a built-in tool") || !strings.Contains(err.Error(), einorun.OffloadReadTool) {
+		t.Fatalf("err %v", err)
+	}
+	// Task list tools exist only with the Planning extension.
+	_, err = run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed,
+		BuiltinTools: map[string]einorun.BuiltinTool{"TaskCreate": {}}})
 	if err == nil || !strings.Contains(err.Error(), "not a built-in tool") {
 		t.Fatalf("err %v", err)
 	}
@@ -176,5 +188,10 @@ func TestInterruptedOutcome(t *testing.T) {
 		if status != c.status || text != c.text {
 			t.Fatalf("%+v: %s %q", c, status, text)
 		}
+	}
+	// Overridden text is used too.
+	custom := einorun.New(einorun.Config{Language: llm.Chinese, Text: einorun.Text{NeedsReview: "请人工核对"}})
+	if status, text := custom.InterruptedOutcome(false, true); status != einorun.StatusNeedsReview || text != "请人工核对" {
+		t.Fatalf("overridden %s %q", status, text)
 	}
 }

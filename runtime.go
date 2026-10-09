@@ -36,9 +36,11 @@ func New(config Config) *Runtime {
 func (r *Runtime) Text() Text { return r.text }
 
 // InterruptedOutcome returns the status and model-visible result the runtime
-// gives a call that started and did not finish, by its traits. Hosts use it
-// to settle such calls outside a run, for example when an external executor
-// is lost, with the same text the runtime uses on recovery.
+// gives a single call that started and did not finish, by its traits and
+// with the runtime's text. Hosts use it to settle such calls outside a run,
+// for example when an external executor is lost. Recovery also turns a call
+// whose sub-agent calls have pending or unrepeatable effects into needs
+// review; hosts leave such calls to the runtime.
 func (r *Runtime) InterruptedOutcome(replayable, sideEffects bool) (CallStatus, string) {
 	return interrupted(replayable, sideEffects, &r.text)
 }
@@ -128,16 +130,19 @@ type Request struct {
 	DiscardUndelivered bool
 	// BuiltinTools adjusts the tools the runtime and the built-in extensions
 	// add, such as the delegation tool, the task list tools, the skill tool
-	// and OffloadReadTool, by model-visible name. Naming a tool the run does
-	// not add is an error; host tools carry these settings in their ToolSpec.
+	// and OffloadReadTool, by model-visible name (including a custom ToolName).
+	// Naming a tool the run does not add is an error; host tools carry these
+	// settings in their ToolSpec. The skill and offload read tools are also
+	// used by sub-agents; a policy tells agents apart by CallView.Agent.
 	BuiltinTools map[string]BuiltinTool
 }
 
 // BuiltinTool adjusts a tool the runtime or a built-in extension adds.
 type BuiltinTool struct {
-	// Notes are added to every call record of the tool.
+	// Notes are added to every call record of the tool; they win over the
+	// tool's own notes with the same key.
 	Notes map[string]string
-	// Policy decides per call, as ToolSpec.Policy does.
+	// Policy, when set, decides per call, as ToolSpec.Policy does.
 	Policy func(ctx context.Context, call CallView) (CallPolicy, error)
 }
 

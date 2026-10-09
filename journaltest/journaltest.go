@@ -8,6 +8,7 @@
 package journaltest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -114,8 +115,8 @@ func (n ids) of(name string) string {
 // child returns a sub-agent call snapshot; sub-agent calls come back in
 // Resume.Calls without needing a block.
 func child(n ids, name string, rev uint64, status einorun.CallStatus) einorun.ToolCall {
-	return einorun.ToolCall{ID: n.of(name), ParentID: n.of("parent"), ModelCallID: n.of("model"), CallID: "c-" + name, Name: "tool",
-		Arguments: "{}", Rev: rev, Status: status, StartedAt: &at}
+	return einorun.ToolCall{ID: n.of(name), ParentID: n.of("parent"), ModelCallID: n.of("model"), CallID: "call_" + name + "_" + n.of("call")[24:],
+		Name: "tool", Arguments: "{}", Rev: rev, Status: status, StartedAt: &at, Replayable: true}
 }
 
 // mainCall returns a main-agent call snapshot.
@@ -131,8 +132,15 @@ func sameJSON(a, b []byte) bool {
 	if len(a) == 0 || len(b) == 0 {
 		return len(a) == len(b)
 	}
-	var x, y any
-	if json.Unmarshal(a, &x) != nil || json.Unmarshal(b, &y) != nil {
+	decode := func(data []byte) (any, error) {
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.UseNumber()
+		var v any
+		return v, decoder.Decode(&v)
+	}
+	x, errX := decode(a)
+	y, errY := decode(b)
+	if errX != nil || errY != nil {
 		return string(a) == string(b)
 	}
 	return reflect.DeepEqual(x, y)
@@ -197,6 +205,10 @@ func differ(a, b einorun.ToolCall) string {
 		return "Payload"
 	case a.Name != b.Name || a.Arguments != b.Arguments:
 		return "Name or Arguments"
+	case a.ParentID != b.ParentID || a.ModelCallID != b.ModelCallID || a.CallID != b.CallID:
+		return "ParentID, ModelCallID or CallID"
+	case a.Replayable != b.Replayable || a.SideEffects != b.SideEffects:
+		return "Replayable or SideEffects"
 	case !maps.Equal(a.Notes, b.Notes):
 		return "Notes"
 	case !sameTime(a.StartedAt, b.StartedAt) || !sameTime(a.CompletedAt, b.CompletedAt):
@@ -419,11 +431,18 @@ func testSteps(t *testing.T, h JournalHarness, n ids) {
 	if resume.Completion == nil || resume.Completion.Source != einorun.FromGuard || !resume.Completion.Fixed || !sameJSON(resume.Completion.Value, []byte(`{"a":1}`)) {
 		t.Fatalf("completion %+v", resume.Completion)
 	}
-	if len(resume.Blocks) != 2 || resume.Blocks[0].Text != "hello" || resume.Blocks[1].Call == nil || resume.Blocks[1].Call.ID != n.of("a") {
+	if len(resume.Blocks) != 2 || resume.Blocks[0].Text != "hello" || resume.Blocks[1].Call == nil || resume.Blocks[1].Call.ID != n.of("a") ||
+		resume.Blocks[0].ModelCallID != n.of("model") || resume.Blocks[1].Position != 2 {
 		t.Fatalf("blocks %+v", resume.Blocks)
+	}
+	if diff := differ(*resume.Blocks[1].Call, main); diff != "" {
+		t.Fatalf("main call read back differs in %s: %+v", diff, *resume.Blocks[1].Call)
 	}
 	if len(resume.Calls) != 1 || resume.Calls[0].ID != n.of("s") {
 		t.Fatalf("sub-agent calls %+v", resume.Calls)
+	}
+	if diff := differ(resume.Calls[0], step.Changes.Calls[1]); diff != "" {
+		t.Fatalf("sub-agent call read back differs in %s: %+v", diff, resume.Calls[0])
 	}
 	if h.Usage != nil {
 		usage, err := h.Usage(ctx)
@@ -525,15 +544,25 @@ func appendMessage(t *testing.T, h FeedHarness, message einorun.Message) (int64,
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The suite keeps its own copy, so a feed sharing memory with it is caught.
+	stored.Meta = maps.Clone(stored.Meta)
+	if stored.Media != nil {
+		media := *stored.Media
+		stored.Media = &media
+	}
 	return seq, stored
 }
 
-// appendUser appends a user message and returns its sequence number and ID.
+// appendUser appends a user message and returns its sequence number and
+// identity (ID and revision).
 func appendUser(t *testing.T, h FeedHarness, content string) (int64, string) {
 	t.Helper()
 	seq, stored := appendMessage(t, h, einorun.Message{ID: llm.NewModelCallID(), Revision: "1", Role: einorun.RoleUser, Content: content})
-	return seq, stored.ID
+	return seq, identity(stored)
 }
+
+// identity returns the key the runtime tells messages apart by.
+func identity(m einorun.Message) string { return m.ID + "@" + m.Revision }
 
 // sameMessage names the first field in which a and b differ, or returns "".
 func sameMessage(a, b einorun.Message) string {
@@ -555,8 +584,11 @@ func testPendingClaim(t *testing.T, h FeedHarness) {
 	if latest, err := h.Feed.Pending(ctx, 0); err != nil || latest != 0 {
 		t.Fatalf("empty pending %d %v", latest, err)
 	}
-	first, _ := appendUser(t, h, "m1")
+	first, firstID := appendUser(t, h, "m1")
 	second, secondID := appendUser(t, h, "m2")
+	if firstID == secondID {
+		t.Fatalf("two messages share the identity %s", firstID)
+	}
 	latest, err := h.Feed.Pending(ctx, 0)
 	if err != nil || latest != second {
 		t.Fatalf("pending %d %v, want %d", latest, err, second)
@@ -572,13 +604,18 @@ func testPendingClaim(t *testing.T, h FeedHarness) {
 		t.Fatalf("claim %+v", claim)
 	}
 	claim, err = h.Feed.Claim(ctx, second)
-	if err != nil || claim.EndSeq != second || len(claim.Messages) < 2 || claim.Messages[len(claim.Messages)-1].ID != secondID {
+	if err != nil || claim.EndSeq != second || len(claim.Messages) < 2 {
 		t.Fatalf("claim snapshot %+v %v", claim, err)
+	}
+	last, previous := claim.Messages[len(claim.Messages)-1], claim.Messages[len(claim.Messages)-2]
+	if identity(last) != secondID || identity(previous) != firstID {
+		t.Fatalf("claimed identities %s, %s, want %s, %s", identity(previous), identity(last), firstID, secondID)
 	}
 }
 
 func testMessageRoundTrip(t *testing.T, h FeedHarness) {
 	ctx := context.Background()
+	seen := map[string]bool{}
 	for _, in := range []einorun.Message{
 		{ID: llm.NewModelCallID(), Revision: "r2", Role: einorun.RoleAssistant, Content: "answer"},
 		{ID: llm.NewModelCallID(), Revision: "r1", Role: einorun.RoleUser, Content: "look",
@@ -590,6 +627,10 @@ func testMessageRoundTrip(t *testing.T, h FeedHarness) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if seen[identity(stored)] {
+			t.Fatalf("two messages share the identity %s", identity(stored))
+		}
+		seen[identity(stored)] = true
 		out := claim.Messages[len(claim.Messages)-1]
 		if diff := sameMessage(out, stored); diff != "" {
 			t.Fatalf("claimed message differs from the stored one in %s: %+v, want %+v", diff, out, stored)

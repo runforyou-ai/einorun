@@ -8,7 +8,10 @@ import (
 
 // Text is the model-facing text the runtime writes. Config.Text overrides
 // the default text of the run's language field by field: empty fields keep
-// the default. Format verbs are documented per field and must be kept.
+// the default. Format verbs are documented per field and must be kept; a
+// missing or wrong verb shows in the text the model sees. Text of other
+// packages (structured output retries, memory, web tools) is set through
+// their own options.
 type Text struct {
 	// Cancelled is the result of a call that never got one because other
 	// input arrived first. %[1]s is the tool name, %[2]s the call identifier.
@@ -144,6 +147,9 @@ func DefaultText(language llm.Language) Text {
 func (t Text) withOverrides(o Text) Text {
 	base, over := reflect.ValueOf(&t).Elem(), reflect.ValueOf(o)
 	for i := range base.NumField() {
+		if over.Field(i).Kind() != reflect.String {
+			continue
+		}
 		if s := over.Field(i).String(); s != "" {
 			base.Field(i).SetString(s)
 		}
