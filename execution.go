@@ -352,7 +352,19 @@ func (e *execution) buildAgent(ctx context.Context, a *agent, instruction string
 	}
 	accounted := &accountedModel{AgenticModel: summaryModel}
 	e.auxiliary = append(e.auxiliary, accounted)
-	summary, err := e.newSummarizer(ctx, accounted)
+	var reservers []ContextReserver
+	for _, ext := range e.extensions.all {
+		if r, ok := ext.(ContextReserver); ok {
+			reservers = append(reservers, r)
+		}
+	}
+	summary, err := e.newSummarizer(ctx, accounted, func() int64 {
+		var total int64
+		for _, r := range reservers {
+			total += int64(max(r.ReservedTokens(a.scope), 0))
+		}
+		return total
+	})
 	if err != nil {
 		return nil, err
 	}

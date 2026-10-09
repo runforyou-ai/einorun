@@ -8,13 +8,14 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/runforyou-ai/einorun/llm"
 )
 
-// ExtractLimits bound the entries Extract accepts. Zero values take the
-// defaults.
+// ExtractLimits bound the entries Extract accepts. Values that are not
+// positive take the defaults.
 type ExtractLimits struct {
 	// Name, Description and Body are the most characters of each field
 	// (default 60, 200 and 2000).
@@ -23,11 +24,11 @@ type ExtractLimits struct {
 	Body        int
 }
 
-// withDefaults fills zero limits.
+// withDefaults replaces limits that are not positive with the defaults.
 func (l ExtractLimits) withDefaults() ExtractLimits {
-	l.Name = cmp.Or(l.Name, 60)
-	l.Description = cmp.Or(l.Description, 200)
-	l.Body = cmp.Or(l.Body, 2000)
+	positive(&l.Name, 60)
+	positive(&l.Description, 200)
+	positive(&l.Body, 2000)
 	return l
 }
 
@@ -42,13 +43,19 @@ type ExtractRequest struct {
 	// the conversation to extract from.
 	Earlier []Message
 	Recent  []Message
+	// Now, when set, tells the model the current time, for turning relative
+	// dates into absolute ones.
+	Now time.Time
 	// Language selects the default text.
 	Language llm.Language
 	Limits   ExtractLimits
 }
 
 // Changes are the memory changes of an extraction. A key appears in at most
-// one of Saved and Deleted.
+// one of Saved and Deleted; a key the model proposed to save is never
+// deleted, even when the proposal was skipped. A key may be both skipped and
+// saved when the model proposed it several times; Saved holds the accepted
+// entry.
 type Changes struct {
 	// Saved are new entries and complete rewrites of existing ones, by key.
 	// UpdatedAt is left for the host.
@@ -114,9 +121,11 @@ func Extract(ctx context.Context, factory llm.ModelFactory, request ExtractReque
 	}
 	var changes Changes
 	saved := map[string]int{}
+	proposedKeys := map[string]bool{}
 	for _, p := range answer.Save {
-		entry := Entry{Key: strings.TrimSpace(p.Key), Name: strings.TrimSpace(p.Name),
+		entry := Entry{Key: existingKey(p.Key, existing), Name: strings.TrimSpace(p.Name),
 			Description: strings.TrimSpace(p.Description), Body: strings.TrimSpace(p.Body)}
+		proposedKeys[entry.Key] = true
 		if reason := problem(entry, existing[entry.Key], limits); reason != "" {
 			changes.Skipped = append(changes.Skipped, Skipped{Entry: entry, Reason: reason})
 			continue
@@ -130,13 +139,23 @@ func Extract(ctx context.Context, factory llm.ModelFactory, request ExtractReque
 		changes.Saved = append(changes.Saved, entry)
 	}
 	for _, key := range answer.Delete {
-		key = strings.TrimSpace(key)
-		if _, ok := saved[key]; ok || !existing[key] || slices.Contains(changes.Deleted, key) {
+		key = existingKey(key, existing)
+		// A key the model also proposed to save is a rewrite, accepted or not.
+		if proposedKeys[key] || !existing[key] || slices.Contains(changes.Deleted, key) {
 			continue
 		}
 		changes.Deleted = append(changes.Deleted, key)
 	}
 	return changes, usage, nil
+}
+
+// existingKey returns key when an existing entry has it as it is, and key
+// without surrounding space otherwise.
+func existingKey(key string, existing map[string]bool) string {
+	if existing[key] {
+		return key
+	}
+	return strings.TrimSpace(key)
 }
 
 // problem returns why a proposed entry is not accepted, or "". Existing keys
@@ -158,6 +177,9 @@ func problem(e Entry, exists bool, limits ExtractLimits) string {
 // extractionInput renders the existing memories and the conversation.
 func extractionInput(text *catalog, request ExtractRequest) (string, error) {
 	var input strings.Builder
+	if !request.Now.IsZero() {
+		input.WriteString(fmt.Sprintf(text.extractNow, request.Now.Format(time.RFC3339)) + "\n\n")
+	}
 	input.WriteString(text.extractEntries + "\n")
 	if len(request.Entries) == 0 {
 		input.WriteString(text.extractNone + "\n")

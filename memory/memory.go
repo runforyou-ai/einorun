@@ -42,4 +42,6 @@ func (f SourceFunc) Memories(ctx context.Context, run einorun.RunScope) ([]Entry
 type Message struct {
 	Role    einorun.Role `json:"role"`
 	Content string       `json:"content"`
+	// At is when the message was sent, when known.
+	At time.Time `json:"at,omitzero"`
 }

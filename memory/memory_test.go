@@ -110,7 +110,7 @@ func source(list []memory.Entry) memory.Source {
 	return memory.SourceFunc(func(context.Context, einorun.RunScope) ([]memory.Entry, error) { return list, nil })
 }
 
-func runWith(t *testing.T, f *fake, ext einorun.Extension, tools ...einorun.ToolSpec) einorun.Result {
+func runWith(t *testing.T, f *fake, ext einorun.Extension) einorun.Result {
 	t.Helper()
 	feed := inmem.NewFeed()
 	feed.Append(einorun.Message{ID: "m1", Revision: "1", Role: einorun.RoleUser, Content: "write me a reply"})
@@ -118,7 +118,7 @@ func runWith(t *testing.T, f *fake, ext einorun.Extension, tools ...einorun.Tool
 	defer cancel()
 	result, err := einorun.New(einorun.Config{Language: llm.English}).Run(ctx, einorun.Request{
 		RunID: "r1", Instruction: "be kind", Model: einorun.Model{New: f.factory}, Feed: feed,
-		Extensions: []einorun.Extension{ext}, Tools: tools,
+		Extensions: []einorun.Extension{ext},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -151,8 +151,18 @@ func TestRecallShowsSelectedMemories(t *testing.T) {
 
 func TestRecallKeepsTheReminderBeforeTheInput(t *testing.T) {
 	f := &fake{answers: []string{`{"keys":["tone"]}`}, steps: []func() *schema.AgenticMessage{callTool("look"), ok()}}
-	look := einorun.ToolSpec{Tool: &lookTool{}}
-	runWith(t, f, memory.Recall(source(entries), memory.RecallOptions{}), look)
+	feed := inmem.NewFeed()
+	feed.Append(einorun.Message{ID: "m1", Revision: "1", Role: einorun.RoleUser, Content: "write me a reply"})
+	// The second call is the last of the budget and ends with the runtime's
+	// closing notice, which is not input.
+	_, err := einorun.New(einorun.Config{Language: llm.English}).Run(context.Background(), einorun.Request{
+		Model: einorun.Model{New: f.factory}, Feed: feed, Limits: einorun.Limits{MaxIterations: 2},
+		Extensions: []einorun.Extension{memory.Recall(source(entries), memory.RecallOptions{})},
+		Tools:      []einorun.ToolSpec{{Tool: &lookTool{}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	second := f.agent[1]
 	reminders := 0
 	at := -1
@@ -162,8 +172,21 @@ func TestRecallKeepsTheReminderBeforeTheInput(t *testing.T) {
 			at = i
 		}
 	}
-	if reminders != 1 || messageText(second[at+1]) != "write me a reply" || messageText(second[len(second)-1]) != "[result]" {
+	if reminders != 1 || messageText(second[at+1]) != "write me a reply" || messageText(second[at+3]) != "[result]" || at+4 != len(second)-1 {
+		for _, m := range second {
+			t.Logf("%s %q", m.Role, messageText(m))
+		}
 		t.Fatalf("second input %d %d", reminders, at)
+	}
+}
+
+func TestExtractNeverDeletesARewrite(t *testing.T) {
+	f := &fake{answers: []string{`{"save":[{"key":"stack","name":"Stack","description":"Tools","body":""}],"delete":["stack"]}`}}
+	changes, _, err := memory.Extract(context.Background(), f.factory, memory.ExtractRequest{
+		Entries: entries, Recent: []memory.Message{{Role: einorun.RoleUser, Content: "we moved to Rust"}},
+	})
+	if err != nil || len(changes.Deleted) != 0 || len(changes.Saved) != 0 || len(changes.Skipped) != 1 {
+		t.Fatalf("changes %+v %v", changes, err)
 	}
 }
 
@@ -300,5 +323,85 @@ func TestExtractCustomCriteriaAndNoInput(t *testing.T) {
 	system := messageText(f.structured[0][0])
 	if !strings.HasPrefix(system, "Remember only food preferences.\n\n## Rules") || strings.Contains(system, "What to remember") {
 		t.Fatalf("instruction %q", system)
+	}
+}
+
+// awaitTool hands its call to an external executor.
+type awaitTool struct{}
+
+func (*awaitTool) Info(context.Context) (*schema.ToolInfo, error) {
+	return &schema.ToolInfo{Name: "dispatch", Desc: "dispatch"}, nil
+}
+
+func (*awaitTool) InvokableRun(context.Context, string, ...tool.Option) (string, error) {
+	return "", einorun.Await(json.RawMessage(`{}`))
+}
+
+func TestRecallAcrossResume(t *testing.T) {
+	f := &fake{answers: []string{`{"keys":["tone"]}`}, steps: []func() *schema.AgenticMessage{callTool("dispatch"), ok()}}
+	feed := inmem.NewFeed()
+	feed.Append(einorun.Message{ID: "m1", Revision: "1", Role: einorun.RoleUser, Content: "write me a reply"})
+	journal := inmem.NewJournal()
+	request := einorun.Request{RunID: "r1", Model: einorun.Model{New: f.factory}, Feed: feed, Journal: journal,
+		Extensions: []einorun.Extension{memory.Recall(source(entries), memory.RecallOptions{})},
+		Tools:      []einorun.ToolSpec{{Tool: &awaitTool{}}}}
+	runtime := einorun.New(einorun.Config{Language: llm.English})
+	ctx := context.Background()
+	result, err := runtime.Run(ctx, request)
+	if err != nil || !result.Suspended {
+		t.Fatalf("first start %+v %v", result, err)
+	}
+	resume := journal.Resume()
+	if strings.Contains(string(resume.State), "Keep replies short.") {
+		t.Fatal("the reminder is in the checkpoint")
+	}
+	output := "done"
+	if err := journal.External(ctx, einorun.ToolCall{ID: result.Blocks[0].Call.ID, Status: einorun.StatusSucceeded, Result: &output}); err != nil {
+		t.Fatal(err)
+	}
+	resume = journal.Resume()
+	request.Resume = &resume
+	result, err = runtime.Run(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.structured) != 1 {
+		t.Fatalf("selections %d", len(f.structured))
+	}
+	if !strings.Contains(messageText(f.agent[1][len(f.agent[1])-4]), "Keep replies short.") {
+		for _, m := range f.agent[1] {
+			t.Logf("%s %q", m.Role, messageText(m))
+		}
+		t.Fatal("no reminder after resume")
+	}
+	if result.Usage.Total != 12+6+12 {
+		t.Fatalf("usage %+v", result.Usage)
+	}
+}
+
+func TestRecallNegativeLimits(t *testing.T) {
+	f := &fake{answers: []string{`{"keys":["tone"]}`}, steps: []func() *schema.AgenticMessage{ok()}}
+	limits := memory.Limits{IndexEntries: -1, IndexBytes: -1, Candidates: -1, Selected: -1, EntryBytes: -1, SelectedBytes: -1, ConversationRunes: -1}
+	runWith(t, f, memory.Recall(source(entries), memory.RecallOptions{Limits: limits}))
+	if !strings.Contains(messageText(f.agent[0][len(f.agent[0])-2]), "Keep replies short.") {
+		t.Fatal("no reminder with default limits")
+	}
+}
+
+func TestExtractKeepsExistingKeys(t *testing.T) {
+	spaced := []memory.Entry{{Key: " tone ", Name: "Tone", Description: "d", Body: "b"}, {Key: "old", Name: "Old", Description: "d", Body: "b"}}
+	f := &fake{answers: []string{`{"save":[{"key":" tone ","name":"Tone","description":"d","body":"new"}],"delete":[" old "]}`}}
+	now := time.Date(2026, 10, 9, 8, 0, 0, 0, time.UTC)
+	changes, _, err := memory.Extract(context.Background(), f.factory, memory.ExtractRequest{
+		Entries: spaced, Now: now, Recent: []memory.Message{{Role: einorun.RoleUser, Content: "x", At: now}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes.Saved) != 1 || changes.Saved[0].Key != " tone " || fmt.Sprint(changes.Deleted) != "[old]" {
+		t.Fatalf("changes %+v", changes)
+	}
+	if input := messageText(f.structured[0][1]); !strings.HasPrefix(input, "Current time: 2026-10-09T08:00:00Z\n\n") || !strings.Contains(input, `"at":"2026-10-09T08:00:00Z"`) {
+		t.Fatalf("input %q", input)
 	}
 }

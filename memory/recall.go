@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -19,8 +20,8 @@ import (
 	"github.com/runforyou-ai/einorun/llm"
 )
 
-// Limits bound what Recall puts in front of the model. Zero values take the
-// defaults.
+// Limits bound what Recall puts in front of the model. Values that are not
+// positive take the defaults.
 type Limits struct {
 	// IndexEntries and IndexBytes bound the index in the instruction
 	// (default 200 entries, 16 KiB); the newest entries are listed.
@@ -40,16 +41,23 @@ type Limits struct {
 	ConversationRunes int
 }
 
-// withDefaults fills zero limits.
+// withDefaults replaces limits that are not positive with the defaults.
 func (l Limits) withDefaults() Limits {
-	l.IndexEntries = cmp.Or(l.IndexEntries, 200)
-	l.IndexBytes = cmp.Or(l.IndexBytes, 16<<10)
-	l.Candidates = cmp.Or(l.Candidates, 200)
-	l.Selected = cmp.Or(l.Selected, 5)
-	l.EntryBytes = cmp.Or(l.EntryBytes, 8<<10)
-	l.SelectedBytes = cmp.Or(l.SelectedBytes, 32<<10)
-	l.ConversationRunes = cmp.Or(l.ConversationRunes, 6000)
+	positive(&l.IndexEntries, 200)
+	positive(&l.IndexBytes, 16<<10)
+	positive(&l.Candidates, 200)
+	positive(&l.Selected, 5)
+	positive(&l.EntryBytes, 8<<10)
+	positive(&l.SelectedBytes, 32<<10)
+	positive(&l.ConversationRunes, 6000)
 	return l
+}
+
+// positive sets *v to fallback when it is not positive.
+func positive(v *int, fallback int) {
+	if *v <= 0 {
+		*v = fallback
+	}
 }
 
 // RecallOptions configure Recall.
@@ -66,13 +74,19 @@ type RecallOptions struct {
 // Each run loads the entries from source once; the instruction lists an
 // index of them. On every claim of new input the run's model picks the
 // entries relevant to the conversation, and each model call of the turn sees
-// them in a reminder before the latest input. The reminder is not part of
-// the history or the checkpoint; the picked keys are. A Source error fails
-// the run; a failed selection shows no memories for that turn. The selection
-// usage counts toward the run.
+// them in a reminder before the latest user input. The reminder is not part
+// of the history or the checkpoint, and its tokens are reserved from the
+// summary threshold; the picked keys are kept in the checkpoint. A resumed run
+// loads the entries again, so it shows their current content and skips
+// picked keys that no longer exist. A Source error fails the run; a failed
+// selection shows no memories for that turn. The selection usage counts
+// toward the run.
 //
-// The index is part of the instruction: hosts that bound the context should
-// include it in ContextPolicy.InstructionTokens.
+// The selection runs when the input is claimed, before the turn starts; new
+// input that arrives meanwhile is taken at the next safe point.
+//
+// Recall only reads. The default instruction makes no promise about saving;
+// hosts that maintain memories (see Extract) say so in Instruction.
 func Recall(source Source, options RecallOptions) einorun.Extension {
 	options.Name = cmp.Or(options.Name, "memory")
 	options.Limits = options.Limits.withDefaults()
@@ -90,10 +104,16 @@ func (p *recallPrototype) Name() string { return p.options.Name }
 
 // Instance loads the run's memories.
 func (p *recallPrototype) Instance(ctx context.Context, run einorun.RunScope) (einorun.Extension, error) {
+	if p.source == nil {
+		return nil, errors.New("memory: Recall has no source")
+	}
 	loaded, err := p.source.Memories(ctx, run)
 	if err != nil {
 		return nil, fmt.Errorf("memory: load memories: %w", err)
 	}
+	loaded = slices.Clone(loaded)
+	slices.SortStableFunc(loaded, func(a, b Entry) int { return b.UpdatedAt.Compare(a.UpdatedAt) })
+	// The newest entry of a key wins.
 	entries := make([]Entry, 0, len(loaded))
 	seen := map[string]bool{}
 	for _, e := range loaded {
@@ -103,11 +123,10 @@ func (p *recallPrototype) Instance(ctx context.Context, run einorun.RunScope) (e
 		seen[e.Key] = true
 		entries = append(entries, e)
 	}
-	slices.SortStableFunc(entries, func(a, b Entry) int { return b.UpdatedAt.Compare(a.UpdatedAt) })
 	text := catalogFor(run.Language)
 	return &recall{
 		name: p.options.Name, usage: cmp.Or(p.options.Instruction, text.usage), limits: p.options.Limits,
-		text: text, language: run.Language, model: run.Model, entries: entries,
+		text: text, language: run.Language, model: run.Model, runID: run.RunID, entries: entries,
 	}, nil
 }
 
@@ -119,6 +138,7 @@ type recall struct {
 	text     *catalog
 	language llm.Language
 	model    llm.ModelFactory
+	runID    string
 	entries  []Entry // newest first
 
 	mu       sync.Mutex
@@ -142,7 +162,7 @@ func (r *recall) Instruction(scope einorun.AgentScope) string {
 	}
 	size := 0
 	for i, e := range r.entries {
-		line := fmt.Sprintf("- %s: %s — %s\n", e.Key, e.Name, e.Description)
+		line := summaryLine(e)
 		if i == r.limits.IndexEntries || size+len(line) > r.limits.IndexBytes {
 			break
 		}
@@ -150,6 +170,23 @@ func (r *recall) Instruction(scope einorun.AgentScope) string {
 		size += len(line)
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// maxSummaryField bounds the key, name and description in index and
+// candidate lines.
+const maxSummaryField = 400
+
+// summaryLine renders an entry as one index line: key, name and description
+// on a single line, each bounded.
+func summaryLine(e Entry) string {
+	field := func(s string) string {
+		s = strings.Join(strings.Fields(s), " ")
+		if len(s) > maxSummaryField {
+			s = truncate(s, maxSummaryField) + "…"
+		}
+		return s
+	}
+	return fmt.Sprintf("- %s: %s — %s\n", field(e.Key), field(e.Name), field(e.Description))
 }
 
 // selection is the model's pick.
@@ -166,16 +203,18 @@ func (r *recall) OnClaim(ctx context.Context, claim einorun.Claim) {
 	var input strings.Builder
 	input.WriteString(r.text.selectMemories + "\n")
 	for _, e := range candidates {
-		fmt.Fprintf(&input, "- %s: %s — %s\n", e.Key, e.Name, e.Description)
+		input.WriteString(summaryLine(e))
 	}
 	input.WriteString("\n" + r.text.selectConversation + "\n" + conversation(claim.Messages, r.limits.ConversationRunes))
 	picked, usage, err := llm.GenerateObject[selection](ctx, r.model, llm.GenerateRequest{
 		Instruction: fmt.Sprintf(r.text.selectInstruction, r.limits.Selected), Input: input.String(), Language: r.language,
 	})
 	var keys []string
-	if err != nil {
-		slog.WarnContext(ctx, "einorun: selecting memories failed, showing none this turn", "error", err)
-	} else {
+	switch {
+	case ctx.Err() != nil:
+	case err != nil:
+		slog.WarnContext(ctx, "einorun: selecting memories failed, showing none this turn", "run_id", r.runID, "error", err)
+	default:
 		known := map[string]bool{}
 		for _, e := range candidates {
 			known[e.Key] = true
@@ -239,7 +278,8 @@ func (r *recall) reminder() string {
 			continue
 		}
 		e := r.entries[i]
-		body := e.Description + "\n" + e.Body
+		// Text that would close the tag is broken up.
+		body := strings.ReplaceAll(e.Description+"\n"+e.Body, "</memory", "< /memory")
 		if len(body) > r.limits.EntryBytes {
 			body = truncate(body, r.limits.EntryBytes) + "\n" + r.text.truncated
 		}
@@ -290,6 +330,14 @@ type recallState struct {
 	Selected []string `json:"selected,omitempty"`
 }
 
+// ReservedTokens estimates the reminder of the main agent.
+func (r *recall) ReservedTokens(scope einorun.AgentScope) int {
+	if !scope.Main {
+		return 0
+	}
+	return llm.EstimateTokens(r.reminder())
+}
+
 // Usage returns the usage of the selections.
 func (r *recall) Usage() llm.Usage {
 	r.mu.Lock()
@@ -324,9 +372,9 @@ func (m *reminderModel) Stream(ctx context.Context, input []*schema.AgenticMessa
 	return m.base.Stream(ctx, m.withReminder(input), opts...)
 }
 
-// withReminder returns input with the reminder before the latest user
-// message that is not a tool result, or after the system instruction when
-// there is none.
+// withReminder returns input with the reminder before the latest user input
+// claimed from the conversation, or after the system instruction when there
+// is none in input.
 func (m *reminderModel) withReminder(input []*schema.AgenticMessage) []*schema.AgenticMessage {
 	text := m.recall.reminder()
 	if text == "" {
@@ -334,9 +382,7 @@ func (m *reminderModel) withReminder(input []*schema.AgenticMessage) []*schema.A
 	}
 	at := -1
 	for i := len(input) - 1; i >= 0; i-- {
-		if input[i].Role == schema.AgenticRoleTypeUser && !slices.ContainsFunc(input[i].ContentBlocks, func(b *schema.ContentBlock) bool {
-			return b != nil && b.Type == schema.ContentBlockTypeFunctionToolResult
-		}) {
+		if input[i].Role == schema.AgenticRoleTypeUser && einorun.IsInput(input[i]) {
 			at = i
 			break
 		}
