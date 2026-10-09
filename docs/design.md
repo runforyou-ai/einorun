@@ -524,6 +524,16 @@ configurable.
 - `memory`: `Recall(Source, RecallOptions{Instruction, Limits})` and
   `Extract(ctx, factory, ExtractRequest{Instruction, Entries, Earlier, Recent,
   Language})`, which returns a change set. Default prompts use neutral wording.
+- `toolname`: `Namer.Name(namespace, identity, server, tool)` builds
+  `<namespace>__<server>__<tool>_<digest>`, at most 64 characters of ASCII
+  letters, digits and underscores; the digest of the server's stable identity
+  and the original tool name always stays, so names are stable and distinct.
+  Transliteration (such as pinyin) is an optional function the host provides.
+- `tools/web`: `web_search` and `web_fetch` over host-provided `Searcher` and
+  `Fetcher`; the package validates arguments (count, time range, http/https
+  addresses) and fails calls as unavailable when no service is provided.
+  `SearchSpec` and `FetchSpec` register them as replayable tools without side
+  effects.
 - The library's own model-facing text (cancellation, interruption, needs
   review, end of budget, batch violations, summary preamble, offload read-back,
   sub-agent description, structured retry, media that cannot be viewed, tool
