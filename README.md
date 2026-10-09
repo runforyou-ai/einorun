@@ -36,6 +36,15 @@ Requires Go 1.27+.
 | [`inmem`](https://pkg.go.dev/github.com/runforyou-ai/einorun/inmem) | In-memory `Feed` and `Journal` |
 | [`journaltest`](https://pkg.go.dev/github.com/runforyou-ai/einorun/journaltest) | Contract suites for your `Feed` and `Journal` |
 
+## Example
+
+[`examples/chat`](examples/chat) is a command-line agent in about 150 lines: an in-memory conversation, a provider model, a tool, the task list and sub-agents, with the reply streamed to the terminal.
+
+```sh
+EINORUN_BRAND=openai EINORUN_BASE_URL=https://api.openai.com/v1 \
+  EINORUN_MODEL=gpt-4.1 EINORUN_API_KEY=... go run ./examples/chat
+```
+
 ## Structured output without a run
 
 ```go
