@@ -86,7 +86,8 @@ type CallOutcome struct {
 	// Call is the call record after the outcome was recorded.
 	Call ToolCall
 	// Raw is the result as the tool returned it, before context management
-	// turned it into what the model sees; empty for failed calls.
+	// turned it into what the model sees; empty for failed calls and calls
+	// waiting for an external result.
 	Raw    string
 	Origin Origin
 }

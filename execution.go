@@ -166,6 +166,13 @@ func (r *Runtime) assemble(ctx context.Context, request Request) (*execution, er
 			return e, err
 		}
 		e.restored = &restored
+		// Extension state comes first, before anything reads it.
+		if err := e.restoreExtensions(restored); err != nil {
+			return e, err
+		}
+		if e.memory != nil {
+			e.memory.Load(*request.Resume)
+		}
 	}
 	e.recorder.onStep = func(ctx context.Context, messages []*schema.AgenticMessage) error {
 		e.saveMu.Lock()
@@ -308,7 +315,7 @@ func (e *execution) buildAgent(ctx context.Context, a *agent, instruction string
 	if len(e.completion.tools) > 0 {
 		handlers = append(handlers, e.completion)
 	}
-	handlers = append(handlers, e.capture, &observerMiddleware{scope: a.scope, observers: e.extensions.outputs})
+	handlers = append(handlers, &observerMiddleware{scope: a.scope, observers: e.extensions.outputs})
 	var outer, inner []compose.ToolMiddleware
 	for _, ext := range e.extensions.all {
 		if m, ok := ext.(ModelMiddleware); ok {
@@ -329,7 +336,12 @@ func (e *execution) buildAgent(ctx context.Context, a *agent, instruction string
 			}
 		}
 	}
-	// The raw result capture is the innermost handler.
+	// The input capture wraps the model inside every extension, so guards see
+	// what the model received; the raw result capture is the innermost
+	// handler around tools.
+	if a.scope.Main {
+		handlers = append(handlers, e.capture)
+	}
 	handlers = append(handlers, &rawCapture{agent: a})
 	middlewares := slices.Concat(outer, []compose.ToolMiddleware{e.toolMiddleware(a)}, inner)
 	built, err := adk.NewTypedChatModelAgent(ctx, &adk.TypedChatModelAgentConfig[*schema.AgenticMessage]{
@@ -437,6 +449,7 @@ func (e *execution) genInput(ctx context.Context, _ *adk.TurnLoop[trigger, *sche
 	switch {
 	case through > 0:
 		e.completion.supersede()
+		e.budget.reset()
 		e.turns++
 		if e.request.Limits.MaxTurns > 0 && e.turns > e.request.Limits.MaxTurns {
 			return nil, fmt.Errorf("einorun: turn limit %d exceeded", e.request.Limits.MaxTurns)
@@ -578,6 +591,12 @@ func (e *execution) onAgentEvents(ctx context.Context, turn *adk.TurnContext[tri
 		e.result.Text, e.result.Completion, e.finished = text, completion, true
 		return nil
 	}
+	// A superseded guard completion decided on the candidate text, which was
+	// not delivered either.
+	if completion != nil && completion.Source == FromGuard {
+		e.dropUndelivered(nil, candidate, true)
+		return nil
+	}
 	e.dropUndelivered(completion, text, false)
 	return nil
 }
@@ -639,6 +658,11 @@ func (e *execution) dropCompletionTail() {
 // afterToolCalls suspends the run when a call waits for an external result,
 // and otherwise delivers new input, preempting at the safe point.
 func (e *execution) afterToolCalls(ctx context.Context) error {
+	// A safe point after every batch keeps corrections, fallbacks and
+	// extension state changed by tools.
+	if err := e.save(ctx); err != nil {
+		return err
+	}
 	if e.recorder.awaiting() {
 		return errSuspended
 	}
@@ -707,16 +731,6 @@ func decodeState(data []byte) (state, error) {
 func (e *execution) restore(ctx context.Context) (bool, error) {
 	s := e.restored
 	resume := e.request.Resume
-	// Extension state first; a stateful extension without state is an error.
-	for name, ext := range e.extensions.stateful {
-		data, ok := s.Extensions[name]
-		if !ok {
-			return false, fmt.Errorf("einorun: checkpoint has no state for extension %s", name)
-		}
-		if err := ext.Restore(data); err != nil {
-			return false, fmt.Errorf("einorun: restore extension %s: %w", name, err)
-		}
-	}
 	messages, err := checkpoint.DecodeMessages(s.Messages)
 	if err != nil {
 		return false, err
@@ -816,6 +830,27 @@ func (e *execution) restore(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
+// restoreExtensions restores the state of stateful extensions. The
+// checkpoint and the registered extensions must agree: a stateful extension
+// without state, or state without its extension, is an error.
+func (e *execution) restoreExtensions(s state) error {
+	for name, ext := range e.extensions.stateful {
+		data, ok := s.Extensions[name]
+		if !ok {
+			return fmt.Errorf("einorun: checkpoint has no state for extension %s", name)
+		}
+		if err := ext.Restore(data); err != nil {
+			return fmt.Errorf("einorun: restore extension %s: %w", name, err)
+		}
+	}
+	for name := range s.Extensions {
+		if _, ok := e.extensions.stateful[name]; !ok {
+			return fmt.Errorf("einorun: checkpoint has state for extension %s, which is not registered", name)
+		}
+	}
+	return nil
+}
+
 // completionAtTail returns the completion of a successful completion call
 // that ends the context, for a crash between saving the call and saving the
 // step.
@@ -844,11 +879,12 @@ func (e *execution) finishRestored(ctx context.Context) error {
 		return nil
 	}
 	if !active.Fixed {
-		latest, err := e.request.Feed.Pending(ctx, e.inputs.boundary())
+		boundary := e.inputs.boundary()
+		latest, err := e.request.Feed.Pending(ctx, boundary)
 		if err != nil {
 			return err
 		}
-		if latest > 0 {
+		if latest > boundary {
 			e.completion.supersede()
 			e.dropCompletionTail()
 			return nil

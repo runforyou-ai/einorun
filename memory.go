@@ -24,6 +24,29 @@ func NewMemoryJournal() *MemoryJournal {
 	return &MemoryJournal{calls: map[string]*ToolCall{}, blocks: map[string]Block{}}
 }
 
+// Load replaces the journal's content with resume, as a host's journal would
+// hold it after a restart.
+func (j *MemoryJournal) Load(resume Resume) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.calls, j.blocks = map[string]*ToolCall{}, map[string]Block{}
+	for _, block := range resume.Blocks {
+		if block.Call != nil {
+			call := block.Call.Clone()
+			j.calls[call.ID] = &call
+			block.Call = &ToolCall{ID: call.ID}
+		}
+		j.blocks[block.ID] = block
+	}
+	for _, c := range resume.Calls {
+		call := c.Clone()
+		j.calls[call.ID] = &call
+	}
+	j.state = slices.Clone(resume.State)
+	j.plan = slices.Clone(resume.Plan)
+	j.completion = cloneCompletion(resume.Completion)
+}
+
 // SaveStep applies a step.
 func (j *MemoryJournal) SaveStep(_ context.Context, step Step) error {
 	for _, call := range step.Changes.Calls {

@@ -92,8 +92,8 @@ returns, in all three cases.
 | Any error from a completion tool | Same, and one correction is used (see Completion) |
 | `Await`, `Detached`, `Complete` | Control results, see below |
 | `SaveToolCall` returns an error wrapping `ErrCallRejected` | The call fails with the reason, the run continues |
-| Any other `Feed` or `Journal` error, context cancellation, framework interrupts | The run aborts; the error chain is kept with `%w` |
-| The model still produces only reasoning after its retry | The run fails with partial results |
+| Any other `Feed` or `Journal` error, context cancellation or deadline (of the run or returned by a tool), framework interrupts | The run aborts; the error chain is kept with `%w` |
+| The model still produces only reasoning after its retry | The run fails with `ErrEmptyResponse` and partial results |
 
 ## Input: Feed
 
@@ -167,6 +167,8 @@ type Step struct {
   the stored ones. Blocks only link to their call.
 - `SaveStep` calls are sequential; `SaveToolCall` may run concurrently with
   each other and with `SaveStep`.
+- The runtime saves a step after every finalized model output, after every
+  batch of tool calls and when a completion becomes active.
 - Calls the runtime settles during recovery are written one by one with
   `SaveToolCall`, so hosts can notify reviewers.
 - Hosts that notify reviewers do so when the merged record newly needs
@@ -313,7 +315,9 @@ type Verdict struct {
 }
 ```
 
-- Guards review direct text only, never completion results.
+- Guards review direct text only, never completion results. Tool observers
+  see every outcome, including failures and calls waiting for an external
+  result (with an empty `Raw`).
 - `Review` runs for every candidate text, including one that turns out to be
   superseded (`Superseded`: the verdict is ignored, notes still apply). Notes
   are written to their calls, with a new revision, before `Review` returns,

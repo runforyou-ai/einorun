@@ -146,9 +146,11 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 	// A batch the completion protocol rejected does not execute.
 	if a.scope.Main {
 		if issue := x.completion.batchIssue(ctx); issue != "" {
-			if _, err := x.finish(ctx, a, input, entry, "", errors.New(issue)); err != nil {
+			call, err := x.finish(ctx, a, input, entry, "", errors.New(issue))
+			if err != nil {
 				return nil, err
 			}
+			x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: call, Origin: OriginExecuted})
 			return text(errorResult(errors.New(issue)))
 		}
 	}
@@ -157,9 +159,11 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 		var err error
 		policy, err = entry.spec.Policy(ctx, CallView{Name: input.Name, Arguments: input.Arguments, CallID: input.CallID, Agent: a.scope})
 		if err != nil {
-			if _, saveErr := x.finish(ctx, a, input, entry, "", err); saveErr != nil {
+			call, saveErr := x.finish(ctx, a, input, entry, "", err)
+			if saveErr != nil {
 				return nil, saveErr
 			}
+			x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: call, Origin: OriginExecuted})
 			return text(errorResult(err))
 		}
 	}
@@ -209,8 +213,10 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 	if execErr == nil && raw == "" {
 		raw = result
 	}
-	// Cancellation and framework interrupts end the run.
-	if _, interrupted := compose.ExtractInterruptInfo(execErr); interrupted || (execErr != nil && ctx.Err() != nil) {
+	// Cancellation, deadlines and framework interrupts end the run, whether
+	// they come from the run's context or from the tool's own.
+	_, interrupted := compose.ExtractInterruptInfo(execErr)
+	if interrupted || (execErr != nil && (ctx.Err() != nil || errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded))) {
 		if _, err := x.finish(ctx, a, input, entry, "", execErr); err != nil {
 			return nil, err
 		}
@@ -221,9 +227,11 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 	}
 	if execErr != nil && entry != nil && entry.spec.Completion && a.scope.Main {
 		message := x.completion.reject(ctx, execErr.Error())
-		if _, err := x.finish(ctx, a, input, entry, "", execErr); err != nil {
+		call, err := x.finish(ctx, a, input, entry, "", execErr)
+		if err != nil {
 			return nil, err
 		}
+		x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: call, Origin: OriginExecuted})
 		return text(errorResult(errors.New(message)))
 	}
 	call, err := x.finish(ctx, a, input, entry, result, execErr)
@@ -232,6 +240,7 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 	}
 	if execErr != nil {
 		slog.WarnContext(ctx, "einorun: tool call failed", "run_id", x.request.RunID, "tool", input.Name, "call_id", input.CallID, "error", execErr)
+		x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: call, Origin: OriginExecuted})
 		return text(errorResult(execErr))
 	}
 	x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: call, Raw: raw, Origin: OriginExecuted})
@@ -242,9 +251,11 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 func (x *execution) control(ctx context.Context, a *agent, input *compose.ToolInput, entry *toolEntry, execCtx context.Context, ctrl *control) (*string, error) {
 	text := func(s string) (*string, error) { return &s, nil }
 	fail := func(reason string) (*string, error) {
-		if _, err := x.finish(ctx, a, input, entry, "", errors.New(reason)); err != nil {
+		call, err := x.finish(ctx, a, input, entry, "", errors.New(reason))
+		if err != nil {
 			return nil, err
 		}
+		x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: call, Origin: OriginExecuted})
 		return text(errorResult(errors.New(reason)))
 	}
 	switch {
@@ -274,11 +285,13 @@ func (x *execution) control(ctx context.Context, a *agent, input *compose.ToolIn
 		if !CanSuspend(execCtx) {
 			return fail(x.text.CannotAwait)
 		}
-		if _, err := x.update(ctx, a, input, func(call *ToolCall) {
+		call, err := x.update(ctx, a, input, func(call *ToolCall) {
 			call.Handover, call.Status, call.Payload = HandoverAwait, StatusWaiting, ctrl.payload
-		}); err != nil {
+		})
+		if err != nil {
 			return nil, err
 		}
+		x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: call, Origin: OriginExecuted})
 		return text(x.text.AwaitingResult)
 	default:
 		if !a.scope.Main {

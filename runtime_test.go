@@ -674,3 +674,248 @@ func TestDuplicateExtensionNames(t *testing.T) {
 		t.Fatal("duplicate names accepted")
 	}
 }
+
+// partialFeed claims at most up to cap at first.
+type partialFeed struct {
+	*inmem.Feed
+	mu   sync.Mutex
+	caps []int64
+}
+
+func (f *partialFeed) Claim(ctx context.Context, through int64) (einorun.Claim, error) {
+	f.mu.Lock()
+	if len(f.caps) > 0 {
+		through = min(through, f.caps[0])
+		f.caps = f.caps[1:]
+	}
+	f.mu.Unlock()
+	return f.Feed.Claim(ctx, through)
+}
+
+func TestPartialClaimContinues(t *testing.T) {
+	feed := &partialFeed{Feed: inmem.NewFeed(), caps: []int64{1}}
+	user(feed.Feed, "m1", "one")
+	user(feed.Feed, "m2", "two")
+	m := &scripted{steps: []step{
+		func(input []*schema.AgenticMessage) *schema.AgenticMessage {
+			return say("re " + lastUser(input))(input)
+		},
+		func(input []*schema.AgenticMessage) *schema.AgenticMessage {
+			return say("re " + lastUser(input))(input)
+		},
+	}}
+	result, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.EndSeq != 2 || result.Text != "re two" {
+		t.Fatalf("result %q %d", result.Text, result.EndSeq)
+	}
+}
+
+func TestDefaultJournalResumesTwice(t *testing.T) {
+	m := &scripted{steps: []step{call(invocation{"dispatch", "{}"})}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "q")
+	dispatch := &fn{name: "dispatch", run: func(context.Context, string) (string, error) { return "", einorun.Await(nil) }}
+	request := einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed, Tools: []einorun.ToolSpec{{Tool: dispatch}}}
+	result, err := run(t, request)
+	if err != nil || !result.Suspended || result.Resume == nil {
+		t.Fatalf("%+v %v", result, err)
+	}
+	for range 2 {
+		request.Resume = result.Resume
+		if result, err = run(t, request); err != nil || !result.Suspended || result.Resume == nil || len(result.Resume.State) == 0 {
+			t.Fatalf("resume %+v %v", result, err)
+		}
+	}
+}
+
+func TestToolDeadlineEndsTheRun(t *testing.T) {
+	m := &scripted{steps: []step{call(invocation{"slow", "{}"})}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "q")
+	slow := &fn{name: "slow", run: func(context.Context, string) (string, error) {
+		return "", fmt.Errorf("fetch: %w", context.DeadlineExceeded)
+	}}
+	_, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed, Tools: []einorun.ToolSpec{{Tool: slow}}})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err %v", err)
+	}
+}
+
+func TestUnknownExtensionStateIsRefused(t *testing.T) {
+	m := &scripted{steps: []step{call(invocation{"dispatch", "{}"})}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "q")
+	journal := inmem.NewJournal()
+	dispatch := &fn{name: "dispatch", run: func(context.Context, string) (string, error) { return "", einorun.Await(nil) }}
+	request := einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed, Journal: journal,
+		Tools: []einorun.ToolSpec{{Tool: dispatch}}, Extensions: []einorun.Extension{&counter{}}}
+	if _, err := run(t, request); err != nil {
+		t.Fatal(err)
+	}
+	resume := journal.Resume()
+	request.Resume, request.Extensions = &resume, nil
+	if _, err := run(t, request); err == nil || !strings.Contains(err.Error(), "not registered") {
+		t.Fatalf("err %v", err)
+	}
+}
+
+func TestSupersededCompletionLeavesTheHistory(t *testing.T) {
+	feed := inmem.NewFeed()
+	user(feed, "m1", "first")
+	m := &scripted{}
+	m.steps = []step{
+		func(input []*schema.AgenticMessage) *schema.AgenticMessage {
+			// New input arrives while the completion call is made.
+			user(feed, "m2", "second")
+			return call(invocation{"ask", `{"x":"which?"}`})(input)
+		},
+		func(input []*schema.AgenticMessage) *schema.AgenticMessage {
+			for _, msg := range input {
+				for _, b := range msg.ContentBlocks {
+					if b.FunctionToolCall != nil && b.FunctionToolCall.Name == "ask" {
+						panic("the superseded completion is still in the history")
+					}
+				}
+			}
+			return call(invocation{"ask", `{"x":"answer to second"}`})(input)
+		},
+	}
+	result, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed,
+		Tools: []einorun.ToolSpec{{Tool: completionTool("ask", false), Completion: true}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Completion == nil || string(result.Completion.Value) != `{"x":"answer to second"}` || result.EndSeq != 2 {
+		t.Fatalf("result %+v", result.Completion)
+	}
+}
+
+func TestResumedTurnWithNewInputGetsAFullBudget(t *testing.T) {
+	m := &scripted{steps: []step{call(invocation{"dispatch", "{}"})}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "q")
+	journal := inmem.NewJournal()
+	dispatch := &fn{name: "dispatch", run: func(context.Context, string) (string, error) { return "", einorun.Await(nil) }}
+	request := einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed, Journal: journal,
+		Tools: []einorun.ToolSpec{{Tool: dispatch}, {Tool: echo("lookup")}}, Limits: einorun.Limits{MaxIterations: 2}}
+	result, err := run(t, request)
+	if err != nil || !result.Suspended {
+		t.Fatalf("%+v %v", result, err)
+	}
+	output := "done"
+	if err := journal.External(context.Background(), einorun.ToolCall{ID: result.Blocks[0].Call.ID, Status: einorun.StatusSucceeded, Result: &output}); err != nil {
+		t.Fatal(err)
+	}
+	user(feed, "m2", "more")
+	// One model call of the restored turn was spent; the new input must still
+	// be able to call a tool before the budget ends.
+	m.steps = []step{
+		func(input []*schema.AgenticMessage) *schema.AgenticMessage {
+			if len(input) > 0 && strings.Contains(lastUser(input), "limit") {
+				panic("the new turn started at the end of the budget")
+			}
+			return call(invocation{"lookup", "{}"})(input)
+		},
+		say("ok"),
+	}
+	resume := journal.Resume()
+	request.Resume = &resume
+	result, err = run(t, request)
+	if err != nil || result.Text != "ok" {
+		t.Fatalf("%+v %v", result, err)
+	}
+}
+
+// instructed contributes an instruction from its state.
+type instructed struct{ counter }
+
+func (i *instructed) Instruction(einorun.AgentScope) string {
+	return fmt.Sprintf("claims so far: %d", i.value)
+}
+
+func TestInstructionSeesRestoredState(t *testing.T) {
+	m := &scripted{steps: []step{call(invocation{"dispatch", "{}"})}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "q")
+	journal := inmem.NewJournal()
+	dispatch := &fn{name: "dispatch", run: func(context.Context, string) (string, error) { return "", einorun.Await(nil) }}
+	request := einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed, Journal: journal, Instruction: "base",
+		Tools: []einorun.ToolSpec{{Tool: dispatch}}, Extensions: []einorun.Extension{&instructed{}}}
+	if _, err := run(t, request); err != nil {
+		t.Fatal(err)
+	}
+	output := "x"
+	resume := journal.Resume()
+	if err := journal.External(context.Background(), einorun.ToolCall{ID: resume.Blocks[0].Call.ID, Status: einorun.StatusSucceeded, Result: &output}); err != nil {
+		t.Fatal(err)
+	}
+	resume = journal.Resume()
+	var system string
+	m.steps = []step{func(input []*schema.AgenticMessage) *schema.AgenticMessage {
+		for _, msg := range input {
+			if msg.Role == schema.AgenticRoleTypeSystem {
+				system = llmText(msg)
+			}
+		}
+		return say("ok")(input)
+	}}
+	request.Resume, request.Extensions = &resume, []einorun.Extension{&instructed{}}
+	if _, err := run(t, request); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(system, "claims so far: 1") {
+		t.Fatalf("system %q", system)
+	}
+}
+
+// llmText returns the text blocks of any message.
+func llmText(m *schema.AgenticMessage) string {
+	var parts []string
+	for _, b := range m.ContentBlocks {
+		if b.UserInputText != nil {
+			parts = append(parts, b.UserInputText.Text)
+		}
+		if b.AssistantGenText != nil {
+			parts = append(parts, b.AssistantGenText.Text)
+		}
+	}
+	return strings.Join(parts, "")
+}
+
+func TestCorrectionSurvivesACrashAfterTheBatch(t *testing.T) {
+	// An invalid completion uses the only correction; the run then suspends on
+	// an awaited call in the next batch. After resuming, another invalid
+	// completion must end with the fallback, not get a second correction.
+	m := &scripted{steps: []step{call(invocation{"ask", `{"x":"bad"}`}), call(invocation{"dispatch", "{}"})}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "q")
+	journal := inmem.NewJournal()
+	dispatch := &fn{name: "dispatch", run: func(context.Context, string) (string, error) { return "", einorun.Await(nil) }}
+	request := einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed, Journal: journal,
+		Tools:      []einorun.ToolSpec{{Tool: completionTool("ask", false), Completion: true}, {Tool: dispatch}},
+		Completion: &einorun.CompletionPolicy{Fallback: func(reason string) json.RawMessage { return json.RawMessage(`"` + reason + `"`) }}}
+	if result, err := run(t, request); err != nil || !result.Suspended {
+		t.Fatalf("%+v %v", result, err)
+	}
+	resume := journal.Resume()
+	var dispatched string
+	for _, b := range resume.Blocks {
+		if b.Call != nil && b.Call.Name == "dispatch" {
+			dispatched = b.Call.ID
+		}
+	}
+	output := "x"
+	if err := journal.External(context.Background(), einorun.ToolCall{ID: dispatched, Status: einorun.StatusSucceeded, Result: &output}); err != nil {
+		t.Fatal(err)
+	}
+	resume = journal.Resume()
+	request.Resume = &resume
+	m.steps = []step{call(invocation{"ask", `{"x":"bad again"}`})}
+	result, err := run(t, request)
+	if err != nil || result.Completion == nil || result.Completion.Source != einorun.FromFallback {
+		t.Fatalf("%+v %v", result.Completion, err)
+	}
+}

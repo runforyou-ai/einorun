@@ -14,8 +14,9 @@ import (
 // fallbackPoll is how often the feed is read when no signal arrives.
 const fallbackPoll = 5 * time.Second
 
-// errEmptyResponse reports a turn that produced neither text nor a completion.
-var errEmptyResponse = errors.New("einorun: the model produced no response")
+// ErrEmptyResponse reports a turn that produced neither text nor a
+// completion, even after the model call was retried.
+var ErrEmptyResponse = errors.New("einorun: the model produced no response")
 
 // trigger is a signal for the turn loop.
 type trigger struct {
@@ -153,8 +154,8 @@ func (i *inputs) claim(ctx context.Context, through int64) (Claim, error) {
 	if claim.EndSeq <= i.claimedSeq {
 		return Claim{}, fmt.Errorf("einorun: feed claimed up to %d, not beyond the claimed %d", claim.EndSeq, i.claimedSeq)
 	}
-	i.claimedSeq = claim.EndSeq
-	i.maxPushed = max(i.maxPushed, claim.EndSeq)
+	// Input above a partial claim stays pending and is pushed again.
+	i.claimedSeq, i.maxPushed = claim.EndSeq, claim.EndSeq
 	return claim, nil
 }
 
@@ -167,7 +168,7 @@ func (i *inputs) replay(ctx context.Context) (Claim, error) {
 	if err != nil {
 		return Claim{}, err
 	}
-	if claim.EndSeq != seq {
+	if claim.EndSeq != seq || len(claim.Messages) == 0 {
 		return Claim{}, errors.New("einorun: feed did not replay the claimed boundary")
 	}
 	return claim, nil
@@ -194,7 +195,7 @@ func (i *inputs) finish(ctx context.Context, turn *adk.TurnContext[trigger, *sch
 		return false, nil
 	}
 	if completion == nil && text == "" {
-		return false, errEmptyResponse
+		return false, ErrEmptyResponse
 	}
 	i.closed = true
 	i.loop.Stop()

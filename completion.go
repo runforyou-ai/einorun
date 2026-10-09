@@ -230,6 +230,13 @@ func (g *budgetGuard) BeforeModelRewriteState(ctx context.Context, state *adk.Ty
 	return ctx, state, nil
 }
 
+// reset starts a new turn's budget, discarding a carry from recovery.
+func (g *budgetGuard) reset() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.iterations, g.carry, g.exhausted = 0, false, false
+}
+
 // carryBudget makes the next run of the agent keep the remaining budget.
 func (g *budgetGuard) carryBudget() {
 	g.mu.Lock()
