@@ -187,12 +187,14 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 			}
 			message := reason.Error()
 			// The host refused the submission; the call fails instead.
-			if _, saveErr := x.update(ctx, a, input, func(call *ToolCall) {
+			failed, saveErr := x.update(ctx, a, input, func(call *ToolCall) {
 				done := time.Now()
 				call.Status, call.Handover, call.Payload, call.Result, call.Error, call.CompletedAt = StatusFailed, HandoverNone, nil, nil, &message, &done
-			}); saveErr != nil {
+			})
+			if saveErr != nil {
 				return nil, saveErr
 			}
+			x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: failed, Origin: OriginExecuted})
 			return text(errorResult(reason))
 		}
 		if err != nil {

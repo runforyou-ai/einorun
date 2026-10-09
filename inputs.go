@@ -154,8 +154,15 @@ func (i *inputs) claim(ctx context.Context, through int64) (Claim, error) {
 	if claim.EndSeq <= i.claimedSeq {
 		return Claim{}, fmt.Errorf("einorun: feed claimed up to %d, not beyond the claimed %d", claim.EndSeq, i.claimedSeq)
 	}
-	// Input above a partial claim stays pending and is pushed again.
-	i.claimedSeq, i.maxPushed = claim.EndSeq, claim.EndSeq
+	i.claimedSeq = claim.EndSeq
+	switch {
+	case claim.EndSeq >= through || i.maxPushed > through:
+		// Input pushed while claiming is already queued for the next turn.
+		i.maxPushed = max(i.maxPushed, claim.EndSeq)
+	default:
+		// Input above a partial claim stays pending and is pushed again.
+		i.maxPushed = claim.EndSeq
+	}
 	return claim, nil
 }
 
