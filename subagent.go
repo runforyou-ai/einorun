@@ -194,12 +194,10 @@ func (e *execution) newSubagent(ctx context.Context, spec SubagentSpec, parentCa
 		budget:    &budgetGuard{max: maxIterations, notice: e.text.FinalNotice},
 		injector:  e.newInjector(),
 		offloaded: newOffloadStore(nil),
-		retry: &modelRetry{runID: e.request.RunID, enabled: e.media.enabled, text: e.text, discard: func(used llm.Usage) {
-			e.agentsMu.Lock()
-			e.subUsage.Add(used)
-			e.agentsMu.Unlock()
-		}},
 	}
+	recorder := &subagentRecorder{e: e, a: a}
+	a.recorder = recorder
+	a.retry = &modelRetry{runID: e.request.RunID, enabled: e.media.enabled, text: e.text, discard: recorder.discarded}
 	tools, releases, err := e.buildTools(ctx, scope)
 	done := func() {
 		for _, release := range releases {
@@ -231,8 +229,22 @@ type subagentRecorder struct {
 	e *execution
 	a *agent
 
-	mu   sync.Mutex
-	last string // the latest model call; a sub-agent calls its model one at a time
+	mu      sync.Mutex
+	last    string // the latest model call; a sub-agent calls its model one at a time
+	saveErr error  // a failed save of discarded usage, reported by the next model call
+}
+
+// discarded adds the usage of a discarded output to the run and saves it.
+// The retry cannot fail, so a save error ends the next model call.
+func (r *subagentRecorder) discarded(used llm.Usage) {
+	r.e.agentsMu.Lock()
+	r.e.subUsage.Add(used)
+	r.e.agentsMu.Unlock()
+	if err := r.e.save(context.Background()); err != nil {
+		r.mu.Lock()
+		r.saveErr = err
+		r.mu.Unlock()
+	}
 }
 
 // WrapModel assigns a ModelCallID to every model call.
@@ -240,13 +252,17 @@ func (r *subagentRecorder) WrapModel(_ context.Context, m model.BaseModel[*schem
 	return &identifiedModel{BaseModel: m, recorder: r}, nil
 }
 
-// begin starts a model call and returns its ModelCallID.
-func (r *subagentRecorder) begin() string {
+// begin starts a model call and returns its ModelCallID, or the error of a
+// failed save.
+func (r *subagentRecorder) begin() (string, error) {
 	id := llm.NewModelCallID()
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.saveErr != nil {
+		return "", &abortError{err: r.saveErr}
+	}
 	r.last = id
-	r.mu.Unlock()
-	return id
+	return id, nil
 }
 
 // AfterModelRewriteState links the output's calls to its model call, adds its
@@ -280,12 +296,20 @@ type identifiedModel struct {
 
 // Generate calls the model with a new ModelCallID.
 func (m *identifiedModel) Generate(ctx context.Context, input []*schema.AgenticMessage, opts ...model.Option) (*schema.AgenticMessage, error) {
-	return m.BaseModel.Generate(llm.WithModelCallID(ctx, m.recorder.begin()), input, opts...)
+	id, err := m.recorder.begin()
+	if err != nil {
+		return nil, err
+	}
+	return m.BaseModel.Generate(llm.WithModelCallID(ctx, id), input, opts...)
 }
 
 // Stream calls the model with a new ModelCallID.
 func (m *identifiedModel) Stream(ctx context.Context, input []*schema.AgenticMessage, opts ...model.Option) (*schema.StreamReader[*schema.AgenticMessage], error) {
-	return m.BaseModel.Stream(llm.WithModelCallID(ctx, m.recorder.begin()), input, opts...)
+	id, err := m.recorder.begin()
+	if err != nil {
+		return nil, err
+	}
+	return m.BaseModel.Stream(llm.WithModelCallID(ctx, id), input, opts...)
 }
 
 // forkResult returns the result of a skill a sub-agent ran: its last answer.

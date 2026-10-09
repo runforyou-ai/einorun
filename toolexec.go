@@ -28,6 +28,7 @@ type agent struct {
 	offloaded    *offloadStore
 	retry        *modelRetry
 	summary      *summarizer
+	recorder     *subagentRecorder // a sub-agent's recorder
 	// modelCalls maps a sub-agent's provider call IDs to the model call that
 	// made them.
 	modelCalls sync.Map
@@ -236,6 +237,10 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 	// they come from the run's context or from the tool's own.
 	_, interrupted := compose.ExtractInterruptInfo(execErr)
 	if abort, ok := errors.AsType[*abortError](execErr); ok {
+		// A sub-agent keeps the mark, so that the delegation ends the run too.
+		if !a.scope.Main {
+			return nil, abort
+		}
 		return nil, abort.err
 	}
 	if interrupted || (execErr != nil && (ctx.Err() != nil || errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded))) {
@@ -361,19 +366,24 @@ func (x *execution) finishWith(ctx context.Context, a *agent, input *compose.Too
 	})
 }
 
-// update changes the record of a call of agent a and writes it.
+// update changes the record of a call of agent a and writes it. A
+// sub-agent's failures are marked to end the run through the delegation.
 func (x *execution) update(ctx context.Context, a *agent, input *compose.ToolInput, change func(*ToolCall)) (ToolCall, error) {
 	if a.scope.Main {
 		return x.recorder.updateCall(ctx, input.CallID, change)
 	}
 	parent, ok := x.recorder.mainCall(a.parentCallID)
 	if !ok {
-		return ToolCall{}, errors.New("einorun: sub-agent call without its delegation call")
+		return ToolCall{}, &abortError{err: errors.New("einorun: sub-agent call without its delegation call")}
 	}
 	if _, exists := x.recorder.childPosition(parent.ID, input.CallID); !exists {
 		x.recorder.childStarted(a.parentCallID, a.modelCallOf(input.CallID), input.Name, input.CallID, input.Arguments)
 	}
-	return x.recorder.updateChild(ctx, parent.ID, input.CallID, change)
+	call, err := x.recorder.updateChild(ctx, parent.ID, input.CallID, change)
+	if err != nil {
+		return call, &abortError{err: err}
+	}
+	return call, nil
 }
 
 // applyPolicy applies a policy's trait overrides and notes.

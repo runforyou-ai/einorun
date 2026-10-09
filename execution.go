@@ -443,7 +443,7 @@ func (e *execution) buildAgent(ctx context.Context, a *agent, instruction string
 	}
 	var first adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage] = e.recorder
 	if !a.scope.Main {
-		first = &subagentRecorder{e: e, a: a}
+		first = a.recorder
 	}
 	handlers := slices.Concat([]adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]{first}, reduce,
 		[]adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]{&argumentsNormalizer{}, patch, a.summary, a.budget})
@@ -1083,12 +1083,14 @@ func (e *execution) finishRestored(ctx context.Context) error {
 // stopped, by their traits, and reports whether a main-agent call still waits
 // for an external result. Calls handed over or submitted stay with whoever
 // advances them; sub-agent calls never keep the run suspended. A call whose
-// sub-agent calls have unknown or pending external effects needs review.
+// sub-agent started calls with side effects that cannot be repeated, or has
+// calls with pending external effects, needs review.
 func settleInterrupted(blocks []Block, children []ToolCall, at time.Time, text *prompt.Runtime) (changed []ToolCall, waiting bool) {
 	risky := map[string]bool{}
 	for _, c := range children {
 		pending := c.Handover != HandoverNone && !c.Status.Settled()
-		if pending || c.Status == StatusNeedsReview || (!c.Status.Settled() && c.SideEffects && !c.Replayable) {
+		started := c.Status != StatusQueued
+		if pending || c.Status == StatusNeedsReview || (started && c.SideEffects && !c.Replayable) {
 			risky[c.ParentID] = true
 		}
 	}

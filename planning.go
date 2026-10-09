@@ -66,8 +66,12 @@ func (p *planningInstance) Name() string { return planningExtensionName }
 
 // bind declares the task list tools and creates their middleware.
 func (p *planningInstance) bind(ctx context.Context, e *execution) error {
+	// Changes are saved before the call succeeds; an interrupted change has
+	// an unknown outcome and is not offered for a repeat that would create
+	// the task again.
 	for _, name := range PlanTools {
-		if err := e.declareTool(name, ToolSpec{Replayable: true, Retain: RetainKeep}, nil); err != nil {
+		reads := name == plantask.TaskGetToolName || name == plantask.TaskListToolName
+		if err := e.declareTool(name, ToolSpec{Replayable: reads, Retain: RetainKeep}, nil); err != nil {
 			return err
 		}
 	}

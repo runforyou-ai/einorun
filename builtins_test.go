@@ -119,7 +119,7 @@ func TestPlanningPublishesAndRestoresThePlan(t *testing.T) {
 	if !result.Suspended || len(result.Plan) != 1 || result.Plan[0].Subject != "Read the files" || result.Plan[0].Status != stream.PlanPending {
 		t.Fatalf("plan %+v", result.Plan)
 	}
-	if result.Blocks[0].Call.SideEffects || !result.Blocks[0].Call.Replayable {
+	if result.Blocks[0].Call.SideEffects || result.Blocks[0].Call.Replayable {
 		t.Fatalf("task call traits %+v", result.Blocks[0].Call)
 	}
 	waiting := result.Blocks[1].Call
@@ -374,5 +374,79 @@ func TestOffloadReadToolNameIsReserved(t *testing.T) {
 		Tools: []einorun.ToolSpec{{Tool: echo(einorun.OffloadReadTool)}}})
 	if err == nil || !strings.Contains(err.Error(), "registered twice") {
 		t.Fatalf("err %v", err)
+	}
+}
+
+// childFailure fails the first save of a sub-agent call.
+type childFailure struct {
+	*inmem.Journal
+	failed atomic.Bool
+}
+
+var errChildSave = errors.New("child save failed")
+
+func (j *childFailure) SaveToolCall(ctx context.Context, call einorun.ToolCall) error {
+	if call.ParentID != "" && j.failed.CompareAndSwap(false, true) {
+		return errChildSave
+	}
+	return j.Journal.SaveToolCall(ctx, call)
+}
+
+func TestSubagentJournalFailureEndsTheRun(t *testing.T) {
+	m := &scripted{steps: []step{
+		call(invocation{"agent", `{"subagent_type":"general","prompt":"p","description":"d"}`}),
+		call(invocation{"lookup", `{"x":"a"}`}),
+		say("sub"),
+		say("main"),
+	}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "go")
+	_, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed, Journal: &childFailure{Journal: inmem.NewJournal()},
+		Tools: []einorun.ToolSpec{{Tool: echo("lookup")}}, Extensions: []einorun.Extension{einorun.Subagent(einorun.SubagentSpec{})}})
+	if !errors.Is(err, errChildSave) {
+		t.Fatalf("err %v", err)
+	}
+}
+
+func TestDelegationWithACompletedEffectNeedsReview(t *testing.T) {
+	m := &scripted{steps: []step{
+		call(invocation{"agent", `{"subagent_type":"general","prompt":"p","description":"d"}`}),
+		call(invocation{"pay", `{"x":"1"}`}),
+		call(invocation{"stop", `{"x":"1"}`}),
+	}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "pay")
+	journal := &frozenJournal{Journal: inmem.NewJournal()}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stop := &fn{name: "stop", run: func(ctx context.Context, _ string) (string, error) {
+		journal.frozen.Store(true)
+		cancel()
+		<-ctx.Done()
+		return "", ctx.Err()
+	}}
+	// Only a policy marks the payment as an effect that cannot be repeated.
+	yes, no := true, false
+	request := einorun.Request{RunID: "r1", Model: einorun.Model{New: m.factory}, Feed: feed, Journal: journal,
+		Tools: []einorun.ToolSpec{
+			{Tool: echo("pay"), Replayable: true, Policy: func(context.Context, einorun.CallView) (einorun.CallPolicy, error) {
+				return einorun.CallPolicy{SideEffects: &yes, Replayable: &no}, nil
+			}},
+			{Tool: stop, Replayable: true},
+		},
+		Extensions: []einorun.Extension{einorun.Subagent(einorun.SubagentSpec{})}}
+	if _, err := einorun.New(einorun.Config{Language: llm.English}).Run(ctx, request); err == nil {
+		t.Fatal("the run did not stop")
+	}
+	journal.frozen.Store(false)
+	m.steps = []step{say("checked")}
+	resume := journal.Resume()
+	request.Resume = &resume
+	result, err := run(t, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Blocks[0].Call.Status != einorun.StatusNeedsReview {
+		t.Fatalf("delegation %+v", result.Blocks[0].Call)
 	}
 }

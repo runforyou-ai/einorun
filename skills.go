@@ -141,10 +141,11 @@ func (s *skillsInstance) ModelMiddlewares(scope AgentScope) []adk.TypedChatModel
 	return []adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]{m}
 }
 
-// forkModes adapts the context modes of skills to what the agent can run:
-// with fork, forked skills run in a fresh sub-agent context (Eino cannot pass
-// the history of AgenticMessage agents to a fork); without, every skill
-// loads in the current context. The backend's values are not changed.
+// forkModes adapts skills to what the agent can run: with fork, forked
+// skills run in a fresh sub-agent context (Eino cannot pass the history of
+// AgenticMessage agents to a fork); without, every skill loads in the
+// current context. Model and agent fields are cleared, so skills run with
+// the run's model and sub-agent. The backend's values are not changed.
 type forkModes struct {
 	skill.Backend
 	fork bool
@@ -166,7 +167,7 @@ func (b forkModes) List(ctx context.Context) ([]skill.FrontMatter, error) {
 	matters, err := b.Backend.List(ctx)
 	matters = slices.Clone(matters)
 	for i := range matters {
-		matters[i].Context = b.mode(matters[i].Context)
+		matters[i].Context, matters[i].Model, matters[i].Agent = b.mode(matters[i].Context), "", ""
 	}
 	return matters, err
 }
@@ -174,6 +175,6 @@ func (b forkModes) List(ctx context.Context) ([]skill.FrontMatter, error) {
 // Get returns the skill with its context mode adapted.
 func (b forkModes) Get(ctx context.Context, name string) (skill.Skill, error) {
 	loaded, err := b.Backend.Get(ctx, name)
-	loaded.Context = b.mode(loaded.Context)
+	loaded.Context, loaded.Model, loaded.Agent = b.mode(loaded.Context), "", ""
 	return loaded, err
 }

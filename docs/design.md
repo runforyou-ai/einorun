@@ -231,7 +231,7 @@ runtime recovers in this order:
 | Main agent, `HandoverAwait` | The run stays suspended | Patch the result |
 | Main or sub-agent, `HandoverDetached` / `HandoverSubmitted` | Not settled; patch the receipt | Patch the receipt |
 | Sub-agent, runtime-owned | Settled like the main agent (sub-agents do not suspend) | — |
-| Sub-agent, `HandoverAwait` (crash while waiting synchronously, projected by the host) | Not suspended, not settled; the record stays with the external executor and the delegation call is settled by its own traits | Kept |
+| Sub-agent, `HandoverAwait` (crash while waiting synchronously, projected by the host) | Not suspended, not settled; the record stays with the external executor and the delegation call needs review | Kept |
 
 Tools that are not registered are treated as not replayable with side
 effects. A delegation call has side effects, and is not replayable, when any
