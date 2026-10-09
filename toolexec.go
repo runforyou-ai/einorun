@@ -220,6 +220,9 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 	// Cancellation, deadlines and framework interrupts end the run, whether
 	// they come from the run's context or from the tool's own.
 	_, interrupted := compose.ExtractInterruptInfo(execErr)
+	if abort, ok := errors.AsType[*abortError](execErr); ok {
+		return nil, abort.err
+	}
 	if interrupted || (execErr != nil && (ctx.Err() != nil || errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded))) {
 		if _, err := x.fail(ctx, a, input, execErr); err != nil {
 			return nil, err

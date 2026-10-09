@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -302,5 +303,34 @@ func TestMediaFollowsTheWholeBatch(t *testing.T) {
 	}
 	if strings.Join(order, ",") != "result,result,media" {
 		t.Fatalf("order %v", order)
+	}
+}
+
+// failingSteps fails the step saved after an offload.
+type failingSteps struct {
+	*inmem.Journal
+	fail bool
+}
+
+func (j *failingSteps) SaveStep(ctx context.Context, step einorun.Step) error {
+	if j.fail {
+		return errors.New("disk unavailable")
+	}
+	return j.Journal.SaveStep(ctx, step)
+}
+
+func TestOffloadSaveFailureEndsTheRun(t *testing.T) {
+	m := &scripted{steps: []step{call(invocation{"dump", "{}"}), say("ok")}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "dump")
+	journal := &failingSteps{Journal: inmem.NewJournal()}
+	dump := &fn{name: "dump", run: func(context.Context, string) (string, error) {
+		journal.fail = true
+		return strings.Repeat("x", 50000), nil
+	}}
+	_, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory, ContextWindow: 4000}, Feed: feed, Journal: journal,
+		Tools: []einorun.ToolSpec{{Tool: dump}}})
+	if err == nil || !strings.Contains(err.Error(), "disk unavailable") {
+		t.Fatalf("err %v", err)
 	}
 }

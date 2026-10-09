@@ -166,10 +166,22 @@ func (s *offloadStore) Write(ctx context.Context, req *filesystem.WriteRequest) 
 	s.files[req.FilePath] = req.Content
 	s.mu.Unlock()
 	if s.saved != nil && strings.HasPrefix(req.FilePath, offloadDir) {
-		return s.saved(ctx)
+		if err := s.saved(ctx); err != nil {
+			return &abortError{err: err}
+		}
 	}
 	return nil
 }
+
+// abortError carries an error that must end the run from inside a tool call,
+// such as a journal failure while offloading a result.
+type abortError struct{ err error }
+
+// Error returns the underlying error.
+func (e *abortError) Error() string { return e.err.Error() }
+
+// Unwrap returns the underlying error.
+func (e *abortError) Unwrap() error { return e.err }
 
 // restoreFile writes a saved file back without saving the checkpoint.
 func (s *offloadStore) restoreFile(ctx context.Context, path, content string) error {
