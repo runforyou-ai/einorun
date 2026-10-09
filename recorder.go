@@ -413,7 +413,7 @@ func (r *recorder) mainCall(providerCallID string) (ToolCall, bool) {
 // with the provider call ID parentCallID, and makes it the delegation's
 // current activity. It returns the record and false when the delegation call
 // is unknown.
-func (r *recorder) childStarted(parentCallID string, name, providerCallID, arguments string) (*ToolCall, bool) {
+func (r *recorder) childStarted(parentCallID, modelCallID, name, providerCallID, arguments string) (*ToolCall, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	position, ok := r.toolPositions[parentCallID]
@@ -421,7 +421,7 @@ func (r *recorder) childStarted(parentCallID string, name, providerCallID, argum
 		return nil, false
 	}
 	parent := r.process[position].Call
-	call := ToolCall{ID: llm.NewModelCallID(), ParentID: parent.ID, ModelCallID: parent.ModelCallID, CallID: providerCallID,
+	call := ToolCall{ID: llm.NewModelCallID(), ParentID: parent.ID, ModelCallID: cmp.Or(modelCallID, parent.ModelCallID), CallID: providerCallID,
 		Arguments: arguments, Status: StatusQueued}
 	r.nameCall(&call, name)
 	r.childPositions[parent.ID+"/"+providerCallID] = len(r.children)

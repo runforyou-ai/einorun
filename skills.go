@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/adk/middlewares/skill"
@@ -49,7 +50,9 @@ type SkillsSpec struct {
 // Skills that declare a forked context run in a sub-agent when the run also
 // has the Subagent extension; otherwise, and inside sub-agents, they load in
 // the current context. The skill tool's results are never offloaded or
-// cleared and are kept verbatim by summaries.
+// cleared and are kept verbatim by summaries. A skill's model and agent
+// fields are not used: forked skills run in the run's sub-agent with the
+// run's model, and fork_with_context runs as fork.
 func Skills(spec SkillsSpec) Extension {
 	spec.ToolName = cmp.Or(spec.ToolName, DefaultSkillTool)
 	return &skillsExtension{spec: spec}
@@ -82,12 +85,16 @@ func (s *skillsInstance) Name() string { return skillsExtensionName }
 // bind declares the skill tool and creates the middlewares of the main agent
 // and of sub-agents.
 func (s *skillsInstance) bind(ctx context.Context, e *execution) error {
-	if err := e.declareTool(s.spec.ToolName, ToolSpec{Replayable: true, Retain: RetainIntact, PinInSummary: true}, nil); err != nil {
-		return err
-	}
+	// Loading a skill has no effects; a forked skill has those of a delegation.
+	spec := ToolSpec{Replayable: true}
 	var hub skill.TypedAgentHub[*schema.AgenticMessage]
 	if e.subagents != nil {
 		hub = e.subagents.agent
+		spec = e.delegationSpec()
+	}
+	spec.Retain, spec.PinInSummary = RetainIntact, true
+	if err := e.declareTool(s.spec.ToolName, spec, nil); err != nil {
+		return err
 	}
 	var err error
 	if s.main, err = s.middleware(ctx, e, hub); err != nil {
@@ -100,10 +107,7 @@ func (s *skillsInstance) bind(ctx context.Context, e *execution) error {
 // middleware creates a skill middleware; without a hub, forked skills load
 // in the current context.
 func (s *skillsInstance) middleware(ctx context.Context, e *execution, hub skill.TypedAgentHub[*schema.AgenticMessage]) (adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage], error) {
-	backend := s.spec.Backend
-	if hub == nil {
-		backend = inlineSkills{backend}
-	}
+	backend := forkModes{Backend: s.spec.Backend, fork: hub != nil}
 	name := s.spec.ToolName
 	forkResult := s.spec.FormatForkResult
 	if forkResult == nil {
@@ -137,21 +141,39 @@ func (s *skillsInstance) ModelMiddlewares(scope AgentScope) []adk.TypedChatModel
 	return []adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]{m}
 }
 
-// inlineSkills loads every skill in the current context.
-type inlineSkills struct{ skill.Backend }
+// forkModes adapts the context modes of skills to what the agent can run:
+// with fork, forked skills run in a fresh sub-agent context (Eino cannot pass
+// the history of AgenticMessage agents to a fork); without, every skill
+// loads in the current context. The backend's values are not changed.
+type forkModes struct {
+	skill.Backend
+	fork bool
+}
 
-// List returns the skills without a forked context.
-func (b inlineSkills) List(ctx context.Context) ([]skill.FrontMatter, error) {
+// mode returns the context mode a skill runs in.
+func (b forkModes) mode(mode skill.ContextMode) skill.ContextMode {
+	switch {
+	case !b.fork:
+		return ""
+	case mode == skill.ContextModeForkWithContext:
+		return skill.ContextModeFork
+	}
+	return mode
+}
+
+// List returns copies of the skills with the context modes adapted.
+func (b forkModes) List(ctx context.Context) ([]skill.FrontMatter, error) {
 	matters, err := b.Backend.List(ctx)
+	matters = slices.Clone(matters)
 	for i := range matters {
-		matters[i].Context = ""
+		matters[i].Context = b.mode(matters[i].Context)
 	}
 	return matters, err
 }
 
-// Get returns the skill without a forked context.
-func (b inlineSkills) Get(ctx context.Context, name string) (skill.Skill, error) {
+// Get returns the skill with its context mode adapted.
+func (b forkModes) Get(ctx context.Context, name string) (skill.Skill, error) {
 	loaded, err := b.Backend.Get(ctx, name)
-	loaded.Context = ""
+	loaded.Context = b.mode(loaded.Context)
 	return loaded, err
 }

@@ -52,6 +52,9 @@ func (planningExtension) Instance(context.Context, RunScope) (Extension, error) 
 type planningInstance struct {
 	middleware adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]
 	publish    func([]PlanTask)
+	// saved persists the checkpoint after a change, before the call that made
+	// it is recorded as succeeded.
+	saved func(ctx context.Context) error
 
 	mu    sync.Mutex
 	files map[string]string
@@ -73,6 +76,7 @@ func (p *planningInstance) bind(ctx context.Context, e *execution) error {
 		return fmt.Errorf("einorun: create the task list middleware: %w", err)
 	}
 	p.middleware, p.publish = middleware, e.recorder.setPlan
+	p.saved = func(ctx context.Context) error { return e.save(ctx) }
 	return nil
 }
 
@@ -92,9 +96,16 @@ type planState struct {
 
 // Save returns the task files and the plan.
 func (p *planningInstance) Save() (json.RawMessage, error) {
+	data, _, err := p.snapshot()
+	return data, err
+}
+
+// snapshot returns the state and the plan it holds, taken together.
+func (p *planningInstance) snapshot() (json.RawMessage, []PlanTask, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return json.Marshal(planState{Files: p.files, Shown: p.shown})
+	data, err := json.Marshal(planState{Files: p.files, Shown: p.shown})
+	return data, slices.Clone(p.shown), err
 }
 
 // Restore restores the task files and the plan.
@@ -139,15 +150,33 @@ func (p *planningInstance) Read(_ context.Context, req *plantask.ReadRequest) (*
 	return &filesystem.FileContent{Content: content}, nil
 }
 
-// Write writes a file and updates the plan when it is a task.
-func (p *planningInstance) Write(_ context.Context, req *plantask.WriteRequest) error {
+// Write writes a file, updates the plan when it is a task and saves the
+// checkpoint.
+func (p *planningInstance) Write(ctx context.Context, req *plantask.WriteRequest) error {
+	p.write(req)
+	return p.save(ctx)
+}
+
+// save persists the checkpoint; a failure ends the run.
+func (p *planningInstance) save(ctx context.Context) error {
+	if p.saved == nil {
+		return nil
+	}
+	if err := p.saved(ctx); err != nil {
+		return &abortError{err: err}
+	}
+	return nil
+}
+
+// write writes a file and updates the plan when it is a task.
+func (p *planningInstance) write(req *plantask.WriteRequest) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	path := filepath.Clean(req.FilePath)
 	p.files[path] = req.Content
 	task, ok := planTask(path, req.Content)
 	if !ok {
-		return nil
+		return
 	}
 	if i := slices.IndexFunc(p.shown, func(t PlanTask) bool { return t.ID == task.ID }); i >= 0 {
 		p.shown[i] = task
@@ -160,24 +189,31 @@ func (p *planningInstance) Write(_ context.Context, req *plantask.WriteRequest) 
 		})
 	}
 	p.publishLocked()
-	return nil
 }
 
-// Delete deletes a file. A deleted task leaves the plan, unless every task
-// left is completed: the framework then clears the list and the plan keeps
-// the tasks as completed.
-func (p *planningInstance) Delete(_ context.Context, req *plantask.DeleteRequest) error {
+// Delete deletes a file and saves the checkpoint. A deleted task leaves the
+// plan, unless every task left is completed: the framework then clears the
+// list and the plan keeps the tasks as completed.
+func (p *planningInstance) Delete(ctx context.Context, req *plantask.DeleteRequest) error {
+	if !p.delete(req) {
+		return nil
+	}
+	return p.save(ctx)
+}
+
+// delete deletes a file and reports whether it existed.
+func (p *planningInstance) delete(req *plantask.DeleteRequest) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	path := filepath.Clean(req.FilePath)
 	content, ok := p.files[path]
 	if !ok {
-		return nil
+		return false
 	}
 	delete(p.files, path)
 	task, ok := planTask(path, content)
 	if !ok {
-		return nil
+		return true
 	}
 	cleanup := task.Status == stream.PlanCompleted
 	for other, otherContent := range p.files {
@@ -186,11 +222,11 @@ func (p *planningInstance) Delete(_ context.Context, req *plantask.DeleteRequest
 		}
 	}
 	if cleanup {
-		return nil
+		return true
 	}
 	p.shown = slices.DeleteFunc(p.shown, func(t PlanTask) bool { return t.ID == task.ID })
 	p.publishLocked()
-	return nil
+	return true
 }
 
 // publishLocked hands a copy of the plan to the recorder.

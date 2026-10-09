@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cloudwego/eino/adk/middlewares/skill"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/runforyou-ai/einorun"
 	"github.com/runforyou-ai/einorun/inmem"
+	"github.com/runforyou-ai/einorun/llm"
 	"github.com/runforyou-ai/einorun/stream"
 )
 
@@ -212,6 +214,164 @@ func TestBuiltinToolNamesClash(t *testing.T) {
 	_, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed,
 		Tools:      []einorun.ToolSpec{{Tool: echo("agent")}},
 		Extensions: []einorun.Extension{einorun.Subagent(einorun.SubagentSpec{})}})
+	if err == nil || !strings.Contains(err.Error(), "registered twice") {
+		t.Fatalf("err %v", err)
+	}
+}
+
+// stepBudget fails every step save after the first n.
+type stepBudget struct {
+	*inmem.Journal
+	mu sync.Mutex
+	n  int
+}
+
+var errStepRefused = errors.New("step refused")
+
+func (j *stepBudget) SaveStep(ctx context.Context, step einorun.Step) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.n == 0 {
+		return errStepRefused
+	}
+	j.n--
+	return j.Journal.SaveStep(ctx, step)
+}
+
+func TestPlanChangesAreSavedBeforeTheCallSucceeds(t *testing.T) {
+	m := &scripted{steps: []step{call(invocation{"TaskCreate", `{"subject":"a","description":"a"}`}), say("ok")}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "plan")
+	// The step after the model output is saved; the save after the task write fails.
+	journal := &stepBudget{Journal: inmem.NewJournal(), n: 1}
+	_, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed, Journal: journal,
+		Extensions: []einorun.Extension{einorun.Planning()}})
+	if !errors.Is(err, errStepRefused) {
+		t.Fatalf("err %v", err)
+	}
+	if m.calls() != 1 {
+		t.Fatalf("model calls %d", m.calls())
+	}
+	for _, b := range journal.Resume().Blocks {
+		if b.Call != nil && b.Call.Status == einorun.StatusSucceeded {
+			t.Fatalf("call recorded as succeeded: %+v", b.Call)
+		}
+	}
+}
+
+func TestSubagentCallsCarryTheirModelCall(t *testing.T) {
+	m := &scripted{steps: []step{
+		call(invocation{"agent", `{"subagent_type":"general","prompt":"p","description":"d"}`}),
+		call(invocation{"lookup", `{"x":"a"}`}),
+		say("sub"),
+		say("main"),
+	}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "go")
+	var seen string
+	lookup := &fn{name: "lookup", run: func(ctx context.Context, _ string) (string, error) {
+		c, _ := einorun.CallFrom(ctx)
+		seen = c.ModelCallID
+		return "ok", nil
+	}}
+	result, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed,
+		Tools: []einorun.ToolSpec{{Tool: lookup}}, Extensions: []einorun.Extension{einorun.Subagent(einorun.SubagentSpec{})}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Calls) != 1 || result.Calls[0].ModelCallID != m.ids[1] || seen != m.ids[1] {
+		t.Fatalf("calls %+v ids %v seen %s", result.Calls, m.ids, seen)
+	}
+	// Without side-effect tools the delegation may be repeated after an interruption.
+	if d := result.Blocks[0].Call; !d.Replayable || d.SideEffects {
+		t.Fatalf("delegation %+v", d)
+	}
+}
+
+// cachedSkills returns the same slice on every List.
+type cachedSkills struct{ matters []skill.FrontMatter }
+
+func (c *cachedSkills) List(context.Context) ([]skill.FrontMatter, error) { return c.matters, nil }
+
+func (c *cachedSkills) Get(_ context.Context, name string) (skill.Skill, error) {
+	return skill.Skill{FrontMatter: c.matters[0], Content: "c"}, nil
+}
+
+func TestSkillBackendIsNotModified(t *testing.T) {
+	backend := &cachedSkills{matters: []skill.FrontMatter{{Name: "tidy", Description: "d", Context: skill.ContextModeForkWithContext}}}
+	m := &scripted{steps: []step{say("hi")}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "hi")
+	if _, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed,
+		Extensions: []einorun.Extension{einorun.Skills(einorun.SkillsSpec{Backend: backend})}}); err != nil {
+		t.Fatal(err)
+	}
+	if backend.matters[0].Context != skill.ContextModeForkWithContext {
+		t.Fatalf("backend changed: %+v", backend.matters)
+	}
+}
+
+// frozenJournal ignores every write once frozen, like a process that died.
+type frozenJournal struct {
+	*inmem.Journal
+	frozen atomic.Bool
+}
+
+func (j *frozenJournal) SaveStep(ctx context.Context, step einorun.Step) error {
+	if j.frozen.Load() {
+		return nil
+	}
+	return j.Journal.SaveStep(ctx, step)
+}
+
+func (j *frozenJournal) SaveToolCall(ctx context.Context, call einorun.ToolCall) error {
+	if j.frozen.Load() {
+		return nil
+	}
+	return j.Journal.SaveToolCall(ctx, call)
+}
+
+func TestInterruptedDelegationWithSideEffectsNeedsReview(t *testing.T) {
+	m := &scripted{steps: []step{
+		call(invocation{"agent", `{"subagent_type":"general","prompt":"p","description":"d"}`}),
+		call(invocation{"pay", `{"x":"1"}`}),
+	}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "pay")
+	journal := &frozenJournal{Journal: inmem.NewJournal()}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pay := &fn{name: "pay", run: func(ctx context.Context, _ string) (string, error) {
+		journal.frozen.Store(true)
+		cancel()
+		<-ctx.Done()
+		return "", ctx.Err()
+	}}
+	request := einorun.Request{RunID: "r1", Model: einorun.Model{New: m.factory}, Feed: feed, Journal: journal,
+		Tools:      []einorun.ToolSpec{{Tool: pay, SideEffects: true}},
+		Extensions: []einorun.Extension{einorun.Subagent(einorun.SubagentSpec{})}}
+	if _, err := einorun.New(einorun.Config{Language: llm.English}).Run(ctx, request); err == nil {
+		t.Fatal("the run did not stop")
+	}
+	journal.frozen.Store(false)
+	m.steps = []step{say("checked")}
+	resume := journal.Resume()
+	request.Resume = &resume
+	result, err := run(t, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Blocks[0].Call.Status != einorun.StatusNeedsReview || len(result.Calls) != 1 || result.Calls[0].Status != einorun.StatusNeedsReview {
+		t.Fatalf("delegation %+v calls %+v", result.Blocks[0].Call, result.Calls)
+	}
+}
+
+func TestOffloadReadToolNameIsReserved(t *testing.T) {
+	m := &scripted{steps: []step{say("hi")}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "hi")
+	_, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed,
+		Tools: []einorun.ToolSpec{{Tool: echo(einorun.OffloadReadTool)}}})
 	if err == nil || !strings.Contains(err.Error(), "registered twice") {
 		t.Fatalf("err %v", err)
 	}

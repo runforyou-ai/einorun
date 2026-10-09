@@ -94,7 +94,7 @@ type execution struct {
 	summary       *summarizer       // the main agent's summarizer
 	agentsMu      sync.Mutex        // guards auxiliary and subUsage, which sub-agents add to
 	auxiliary     []*accountedModel // models the runtime calls besides the agents'
-	subUsage      llm.Usage         // usage of finished sub-agents
+	subUsage      llm.Usage         // usage of sub-agents
 	subagents     *subagentInstance // the Subagent extension of the run, if any
 
 	saveMu     sync.Mutex
@@ -143,6 +143,10 @@ func (r *Runtime) assemble(ctx context.Context, request Request) (*execution, er
 
 	tools, completionTools, err := e.registerTools(ctx, e.main.scope)
 	if err != nil {
+		return e, err
+	}
+	// Every agent's context management adds the offload read tool.
+	if err := e.declareTool(OffloadReadTool, ToolSpec{Replayable: true, Retain: RetainIntact}, nil); err != nil {
 		return e, err
 	}
 	limit := request.Limits.Corrections
@@ -335,9 +339,12 @@ func (e *execution) registerTools(ctx context.Context, scope AgentScope) ([]tool
 	return tools, completions, nil
 }
 
-// toolSpecs returns the specs of the tools an agent uses.
+// toolSpecs returns the specs of the tools an agent uses; sub-agents get
+// neither MainOnly nor completion tools.
 func (e *execution) toolSpecs(scope AgentScope) []ToolSpec {
-	return slices.DeleteFunc(slices.Clone(e.request.Tools), func(spec ToolSpec) bool { return spec.MainOnly && !scope.Main })
+	return slices.DeleteFunc(slices.Clone(e.request.Tools), func(spec ToolSpec) bool {
+		return !scope.Main && (spec.MainOnly || spec.Completion)
+	})
 }
 
 // buildTools builds the tools of an agent, in the order of toolSpecs, and
@@ -420,7 +427,7 @@ func (e *execution) buildAgent(ctx context.Context, a *agent, instruction string
 	}
 	var first adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage] = e.recorder
 	if !a.scope.Main {
-		first = &subagentRecorder{usage: &a.usage}
+		first = &subagentRecorder{e: e, a: a}
 	}
 	handlers := slices.Concat([]adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]{first}, reduce,
 		[]adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]{&argumentsNormalizer{}, patch, a.summary, a.budget})
@@ -817,15 +824,17 @@ func (e *execution) totalUsage() llm.Usage {
 func (e *execution) save(ctx context.Context) error {
 	e.saveMu.Lock()
 	defer e.saveMu.Unlock()
-	encoded, err := e.encodeState()
+	plan := e.recorder.currentPlan()
+	encoded, err := e.encodeState(&plan)
 	if err != nil {
 		return err
 	}
-	return e.recorder.saveStep(ctx, Step{Usage: e.totalUsage(), Plan: e.recorder.currentPlan(), Completion: e.completion.current(), State: encoded})
+	return e.recorder.saveStep(ctx, Step{Usage: e.totalUsage(), Plan: plan, Completion: e.completion.current(), State: encoded})
 }
 
-// encodeState encodes the checkpoint; the caller holds saveMu.
-func (e *execution) encodeState() ([]byte, error) {
+// encodeState encodes the checkpoint; the caller holds saveMu. A task list
+// replaces *plan with the plan of the state it saves, so that both agree.
+func (e *execution) encodeState(plan *[]PlanTask) ([]byte, error) {
 	messages, err := checkpoint.EncodeMessages(e.context)
 	if err != nil {
 		return nil, err
@@ -839,7 +848,13 @@ func (e *execution) encodeState() ([]byte, error) {
 	}
 	s.MediaCount, s.MediaBytes = e.media.budget.used()
 	for name, ext := range e.extensions.stateful {
-		data, err := ext.Save()
+		var data json.RawMessage
+		var err error
+		if p, ok := ext.(*planningInstance); ok {
+			data, *plan, err = p.snapshot()
+		} else {
+			data, err = ext.Save()
+		}
 		if err != nil {
 			return nil, fmt.Errorf("einorun: save extension %s: %w", name, err)
 		}
@@ -1048,8 +1063,16 @@ func (e *execution) finishRestored(ctx context.Context) error {
 // settleInterrupted settles calls that did not finish before the run
 // stopped, by their traits, and reports whether a main-agent call still waits
 // for an external result. Calls handed over or submitted stay with whoever
-// advances them; sub-agent calls never keep the run suspended.
+// advances them; sub-agent calls never keep the run suspended. A call whose
+// sub-agent calls have unknown or pending external effects needs review.
 func settleInterrupted(blocks []Block, children []ToolCall, at time.Time, text *prompt.Runtime) (changed []ToolCall, waiting bool) {
+	risky := map[string]bool{}
+	for _, c := range children {
+		pending := c.Handover != HandoverNone && !c.Status.Settled()
+		if pending || c.Status == StatusNeedsReview || (!c.Status.Settled() && c.SideEffects && !c.Replayable) {
+			risky[c.ParentID] = true
+		}
+	}
 	settle := func(call *ToolCall, main bool) {
 		if call.Status.Settled() || call.Handover == HandoverDetached || call.Handover == HandoverSubmitted {
 			return
@@ -1058,7 +1081,11 @@ func settleInterrupted(blocks []Block, children []ToolCall, at time.Time, text *
 			waiting = waiting || main
 			return
 		}
-		status, result := interrupted(call.Replayable, call.SideEffects, text)
+		replayable, sideEffects := call.Replayable, call.SideEffects
+		if main && risky[call.ID] {
+			replayable, sideEffects = false, true
+		}
+		status, result := interrupted(replayable, sideEffects, text)
 		call.Status, call.Result, call.CompletedAt = status, &result, &at
 		call.Rev++
 		changed = append(changed, call.Clone())

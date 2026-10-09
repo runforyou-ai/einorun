@@ -28,7 +28,16 @@ type agent struct {
 	offloaded    *offloadStore
 	retry        *modelRetry
 	summary      *summarizer
-	usage        usageTotal // a sub-agent's finalized outputs
+	// modelCalls maps a sub-agent's provider call IDs to the model call that
+	// made them.
+	modelCalls sync.Map
+}
+
+// modelCallOf returns the model call that made a sub-agent's call.
+func (a *agent) modelCallOf(providerCallID string) string {
+	id, _ := a.modelCalls.Load(providerCallID)
+	s, _ := id.(string)
+	return s
 }
 
 // rawResults keeps the result each tool returned before context management
@@ -362,7 +371,7 @@ func (x *execution) update(ctx context.Context, a *agent, input *compose.ToolInp
 		return ToolCall{}, errors.New("einorun: sub-agent call without its delegation call")
 	}
 	if _, exists := x.recorder.childPosition(parent.ID, input.CallID); !exists {
-		x.recorder.childStarted(a.parentCallID, input.Name, input.CallID, input.Arguments)
+		x.recorder.childStarted(a.parentCallID, a.modelCallOf(input.CallID), input.Name, input.CallID, input.Arguments)
 	}
 	return x.recorder.updateChild(ctx, parent.ID, input.CallID, change)
 }

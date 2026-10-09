@@ -92,8 +92,7 @@ func (s *subagentInstance) Name() string { return subagentExtensionName }
 func (s *subagentInstance) bind(ctx context.Context, e *execution) error {
 	s.e, s.agent = e, &subagentType{s: s}
 	s.spec.Description = cmp.Or(s.spec.Description, e.text.SubagentDescription)
-	sideEffects := slices.ContainsFunc(e.toolSpecs(AgentScope{}), func(spec ToolSpec) bool { return spec.SideEffects })
-	if err := e.declareTool(s.spec.ToolName, ToolSpec{Replayable: true, SideEffects: sideEffects}, describeDelegation); err != nil {
+	if err := e.declareTool(s.spec.ToolName, e.delegationSpec(), describeDelegation); err != nil {
 		return err
 	}
 	guide := fmt.Sprintf(e.text.SubagentGuide, s.spec.ToolName)
@@ -123,6 +122,14 @@ func (s *subagentInstance) ModelMiddlewares(scope AgentScope) []adk.TypedChatMod
 	return []adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]{s.middleware}
 }
 
+// delegationSpec returns the traits of a call a sub-agent serves: with side
+// effects, and not to be repeated after an interruption, when a tool the
+// sub-agent can use has side effects.
+func (e *execution) delegationSpec() ToolSpec {
+	sideEffects := slices.ContainsFunc(e.toolSpecs(AgentScope{}), func(spec ToolSpec) bool { return spec.SideEffects })
+	return ToolSpec{Replayable: !sideEffects, SideEffects: sideEffects}
+}
+
 // describeDelegation returns the task description of a delegation call.
 func describeDelegation(arguments string) string {
 	var parsed struct {
@@ -146,8 +153,7 @@ func (t *subagentType) Get(context.Context, string, *skill.TypedAgentHubOptions[
 }
 
 // Run builds a sub-agent for one delegation, the tool call in ctx, and
-// forwards its events; the sub-agent's tools are released and its usage is
-// added to the run when it ends.
+// forwards its events; the sub-agent's tools are released when it ends.
 func (t *subagentType) Run(ctx context.Context, input *adk.TypedAgentInput[*schema.AgenticMessage], options ...adk.AgentRunOption) *adk.AsyncIterator[*adk.TypedAgentEvent[*schema.AgenticMessage]] {
 	iterator, generator := adk.NewAsyncIteratorPair[*adk.TypedAgentEvent[*schema.AgenticMessage]]()
 	fail := func(err error) *adk.AsyncIterator[*adk.TypedAgentEvent[*schema.AgenticMessage]] {
@@ -179,8 +185,7 @@ func (t *subagentType) Run(ctx context.Context, input *adk.TypedAgentInput[*sche
 }
 
 // newSubagent builds a sub-agent serving the main-agent call with the
-// provider call ID parentCallID. The returned function releases its tools and
-// adds its usage to the run.
+// provider call ID parentCallID. The returned function releases its tools.
 func (e *execution) newSubagent(ctx context.Context, spec SubagentSpec, parentCallID string, input *adk.TypedAgentInput[*schema.AgenticMessage]) (adk.TypedAgent[*schema.AgenticMessage], func(), error) {
 	scope := AgentScope{Name: spec.Name}
 	maxIterations := cmp.Or(spec.MaxIterations, e.budget.max)
@@ -189,18 +194,17 @@ func (e *execution) newSubagent(ctx context.Context, spec SubagentSpec, parentCa
 		budget:    &budgetGuard{max: maxIterations, notice: e.text.FinalNotice},
 		injector:  e.newInjector(),
 		offloaded: newOffloadStore(nil),
-		retry:     &modelRetry{runID: e.request.RunID, enabled: e.media.enabled, text: e.text},
+		retry: &modelRetry{runID: e.request.RunID, enabled: e.media.enabled, text: e.text, discard: func(used llm.Usage) {
+			e.agentsMu.Lock()
+			e.subUsage.Add(used)
+			e.agentsMu.Unlock()
+		}},
 	}
 	tools, releases, err := e.buildTools(ctx, scope)
 	done := func() {
 		for _, release := range releases {
 			release()
 		}
-		used := a.usage.total()
-		used.Add(a.retry.discarded())
-		e.agentsMu.Lock()
-		e.subUsage.Add(used)
-		e.agentsMu.Unlock()
 	}
 	if err != nil {
 		done()
@@ -218,43 +222,52 @@ func (e *execution) newSubagent(ctx context.Context, spec SubagentSpec, parentCa
 	return built, done, nil
 }
 
-// usageTotal adds up the usage of an agent's model outputs.
-type usageTotal struct {
-	mu    sync.Mutex
-	usage llm.Usage
-}
-
-// add adds usage.
-func (u *usageTotal) add(usage llm.Usage) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	u.usage.Add(usage)
-}
-
-// total returns the usage added.
-func (u *usageTotal) total() llm.Usage {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return u.usage
-}
-
 // subagentRecorder takes the recorder's place in a sub-agent: every model
-// call carries a ModelCallID and finalized outputs count usage; the outputs
-// are not part of the run's process.
+// call carries a ModelCallID, the calls of an output remember it, and each
+// finalized output adds its usage to the run and is saved with the next
+// checkpoint at once. The outputs are not part of the run's process.
 type subagentRecorder struct {
 	adk.TypedBaseChatModelAgentMiddleware[*schema.AgenticMessage]
-	usage *usageTotal
+	e *execution
+	a *agent
+
+	mu   sync.Mutex
+	last string // the latest model call; a sub-agent calls its model one at a time
 }
 
 // WrapModel assigns a ModelCallID to every model call.
 func (r *subagentRecorder) WrapModel(_ context.Context, m model.BaseModel[*schema.AgenticMessage], _ *adk.TypedModelContext[*schema.AgenticMessage]) (model.BaseModel[*schema.AgenticMessage], error) {
-	return &identifiedModel{BaseModel: m}, nil
+	return &identifiedModel{BaseModel: m, recorder: r}, nil
 }
 
-// AfterModelRewriteState counts the usage of the finalized output.
+// begin starts a model call and returns its ModelCallID.
+func (r *subagentRecorder) begin() string {
+	id := llm.NewModelCallID()
+	r.mu.Lock()
+	r.last = id
+	r.mu.Unlock()
+	return id
+}
+
+// AfterModelRewriteState links the output's calls to its model call, adds its
+// usage to the run and saves it.
 func (r *subagentRecorder) AfterModelRewriteState(ctx context.Context, state *adk.TypedChatModelAgentState[*schema.AgenticMessage], _ *adk.TypedModelContext[*schema.AgenticMessage]) (context.Context, *adk.TypedChatModelAgentState[*schema.AgenticMessage], error) {
-	if n := len(state.Messages); n > 0 {
-		r.usage.add(llm.UsageOf(state.Messages[n-1].ResponseMeta))
+	n := len(state.Messages)
+	if n == 0 {
+		return ctx, state, nil
+	}
+	output := state.Messages[n-1]
+	r.mu.Lock()
+	id := r.last
+	r.mu.Unlock()
+	for _, c := range toolCalls(output) {
+		r.a.modelCalls.Store(c.CallID, id)
+	}
+	r.e.agentsMu.Lock()
+	r.e.subUsage.Add(llm.UsageOf(output.ResponseMeta))
+	r.e.agentsMu.Unlock()
+	if err := r.e.save(ctx); err != nil {
+		return ctx, state, &abortError{err: err}
 	}
 	return ctx, state, nil
 }
@@ -262,16 +275,17 @@ func (r *subagentRecorder) AfterModelRewriteState(ctx context.Context, state *ad
 // identifiedModel calls a model with a new ModelCallID in the context.
 type identifiedModel struct {
 	model.BaseModel[*schema.AgenticMessage]
+	recorder *subagentRecorder
 }
 
 // Generate calls the model with a new ModelCallID.
 func (m *identifiedModel) Generate(ctx context.Context, input []*schema.AgenticMessage, opts ...model.Option) (*schema.AgenticMessage, error) {
-	return m.BaseModel.Generate(llm.WithModelCallID(ctx, llm.NewModelCallID()), input, opts...)
+	return m.BaseModel.Generate(llm.WithModelCallID(ctx, m.recorder.begin()), input, opts...)
 }
 
 // Stream calls the model with a new ModelCallID.
 func (m *identifiedModel) Stream(ctx context.Context, input []*schema.AgenticMessage, opts ...model.Option) (*schema.StreamReader[*schema.AgenticMessage], error) {
-	return m.BaseModel.Stream(llm.WithModelCallID(ctx, llm.NewModelCallID()), input, opts...)
+	return m.BaseModel.Stream(llm.WithModelCallID(ctx, m.recorder.begin()), input, opts...)
 }
 
 // forkResult returns the result of a skill a sub-agent ran: its last answer.

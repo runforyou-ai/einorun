@@ -234,7 +234,9 @@ runtime recovers in this order:
 | Sub-agent, `HandoverAwait` (crash while waiting synchronously, projected by the host) | Not suspended, not settled; the record stays with the external executor and the delegation call is settled by its own traits | Kept |
 
 Tools that are not registered are treated as not replayable with side
-effects. A delegation call has side effects when any of the other tools does.
+effects. A delegation call has side effects, and is not replayable, when any
+tool available to sub-agents has side effects; on recovery it needs review
+when one of its sub-agent calls has pending or unknown external effects.
 
 ## Output control
 
