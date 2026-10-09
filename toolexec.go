@@ -16,13 +16,19 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
-// agent is the per-agent state of tool execution.
+// agent is the per-agent state of an agent of the run.
 type agent struct {
 	scope AgentScope
 	// parentCallID is the provider call ID of the delegation call a sub-agent
 	// serves; empty for the main agent.
 	parentCallID string
 	raw          rawResults
+	budget       *budgetGuard
+	injector     *mediaInjector
+	offloaded    *offloadStore
+	retry        *modelRetry
+	summary      *summarizer
+	usage        usageTotal // a sub-agent's finalized outputs
 }
 
 // rawResults keeps the result each tool returned before context management
@@ -249,7 +255,7 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 	if err != nil {
 		return nil, err
 	}
-	x.injector.add(input.CallID, refs)
+	a.injector.add(input.CallID, refs)
 	if execErr != nil {
 		slog.WarnContext(ctx, "einorun: tool call failed", "run_id", x.request.RunID, "tool", input.Name, "call_id", input.CallID, "error", execErr)
 		x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: call, Origin: OriginExecuted})

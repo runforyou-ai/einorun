@@ -13,6 +13,7 @@ Eino's ADK gives you the agent loop; einorun adds what a production host needs a
 - **Tool calls handed over.** Tools can hand a call to another system and wait (`Await`), carry on with a receipt (`Detached`) or submit it for a human decision.
 - **Structured completion and output guards.** End a run with a structured decision, check final text before it is delivered, share one correction budget.
 - **Context management.** Large results are offloaded, old tool calls cleared, long histories summarized.
+- **Built-in extensions:** a task list (`Planning`), delegation to sub-agents (`Subagent`) and skills (`Skills`).
 - **A live stream** of the run's process, and **provider adapters** for the major model vendors.
 
 einorun knows nothing about your business. Your instructions, tools, approvals and executors plug in through tool specs, guards and extensions. Persistence is yours too: implement two small interfaces against your own schema, and check them with `journaltest`.

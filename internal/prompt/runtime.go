@@ -50,6 +50,21 @@ type Runtime struct {
 	SummaryPreamble string
 	// OffloadRead describes the tool that reads offloaded results.
 	OffloadRead string
+	// SubagentDescription describes the general sub-agent.
+	SubagentDescription string
+	// SubagentTool describes the delegation tool.
+	SubagentTool string
+	// SubagentGuide is added to the main agent's instruction when it can
+	// delegate. %s is the delegation tool name.
+	SubagentGuide string
+	// SubagentTypes introduces the list of sub-agents.
+	SubagentTypes string
+	// SubagentNoResult is the result of a delegation whose sub-agent gave no
+	// answer.
+	SubagentNoResult string
+	// SkillForkResult wraps the answer of a skill run by a sub-agent. %[1]s
+	// is the skill name, %[2]s the answer.
+	SkillForkResult string
 }
 
 var runtimes = map[string]*Runtime{
@@ -72,6 +87,12 @@ var runtimes = map[string]*Runtime{
 		ListSeparator:         "、",
 		SummaryPreamble:       "【较早对话摘要】此前的对话已压缩为以下摘要，摘要之后的消息保持原样。",
 		OffloadRead:           "读取本次运行中因结果过大而转存的工具输出，file_path 使用转存提示中给出的路径。",
+		SubagentDescription:   "通用子 Agent：使用与你相同的工具（不含委派与任务清单工具），适合调研资料、查阅大量内容、独立完成一段工作等可以单独交付结果的任务。",
+		SubagentTool:          "把一个可以独立完成的子任务交给子 Agent。子 Agent 看不到本次对话，prompt 中写清目标、已知信息和期望的结果形式；description 用一句短语概括任务。子 Agent 的最终回答作为结果返回给你，不会展示给用户。可以在一次回复中发起多个调用并行执行。",
+		SubagentGuide:         "可以用 %s 工具把独立的子任务交给子 Agent，只取回结论，适合需要大量查阅或可以并行的工作；简单任务直接自己完成。",
+		SubagentTypes:         "可用的子 Agent 类型：",
+		SubagentNoResult:      "子 Agent 没有给出结果。",
+		SkillForkResult:       "技能 %[1]s 已由子 Agent 执行完成，结果：\n%[2]s",
 	},
 	"en": {
 		Cancelled:             "Tool call %[1]s (ID %[2]s) was cancelled: another message arrived before it finished.",
@@ -92,6 +113,12 @@ var runtimes = map[string]*Runtime{
 		ListSeparator:         ", ",
 		SummaryPreamble:       "[Summary of earlier conversation] The conversation so far is summarized below; the messages after the summary are unchanged.",
 		OffloadRead:           "Read a tool output of this run that was offloaded because it was too large; use the file_path given in the offload note.",
+		SubagentDescription:   "General sub-agent: uses the same tools as you (without delegation and the task list), for tasks that can be delivered on their own, such as research, reading a lot of material or completing a separate piece of work.",
+		SubagentTool:          "Hand a self-contained task to a sub-agent. The sub-agent cannot see this conversation: state the goal, what is known and the expected form of the result in prompt; summarize the task in a short phrase in description. The sub-agent's final answer is returned to you and is not shown to the user. Several calls in one response run in parallel.",
+		SubagentGuide:         "Use the %s tool to hand self-contained tasks to sub-agents and get back only their conclusions, for work that needs a lot of reading or can run in parallel; do simple tasks yourself.",
+		SubagentTypes:         "Available sub-agent types:",
+		SubagentNoResult:      "The sub-agent gave no result.",
+		SkillForkResult:       "Skill %[1]s was run by a sub-agent. Result:\n%[2]s",
 	},
 }
 

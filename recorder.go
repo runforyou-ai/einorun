@@ -24,6 +24,8 @@ import (
 type toolEntry struct {
 	spec ToolSpec
 	name string
+	// describe returns the description shown for a call, by its arguments.
+	describe func(arguments string) string
 }
 
 // recorder keeps the process of one execution attempt: blocks in model
@@ -39,7 +41,6 @@ type recorder struct {
 	toolPositions  map[string]int // provider call ID of main-agent calls
 	tools          map[string]*toolEntry
 	activity       map[string]string // record ID of a delegation call -> tool a sub-agent is calling
-	describe       func(ToolCall) string
 	plan           []PlanTask
 	changes        changeSet
 	call           *modelCall
@@ -482,6 +483,14 @@ func (r *recorder) currentPlan() []PlanTask {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return slices.Clone(r.plan)
+}
+
+// setPlan replaces the plan and publishes it; it is saved with the next step.
+func (r *recorder) setPlan(plan []PlanTask) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.plan = plan
+	r.pub.add(stream.Operation{Kind: stream.OpSetPlan, Plan: slices.Clone(plan)})
 }
 
 // annotate writes notes to calls by record ID and returns the changed records.

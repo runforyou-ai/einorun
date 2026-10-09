@@ -156,6 +156,12 @@ type offloadStore struct {
 	saved func(ctx context.Context) error
 }
 
+// newOffloadStore returns an empty store; saved, when not nil, persists the
+// checkpoint after an offload.
+func newOffloadStore(saved func(ctx context.Context) error) *offloadStore {
+	return &offloadStore{InMemoryBackend: filesystem.NewInMemoryBackend(), files: map[string]string{}, saved: saved}
+}
+
 // Write stores a file and remembers it, atomically for snapshots.
 func (s *offloadStore) Write(ctx context.Context, req *filesystem.WriteRequest) error {
 	s.mu.Lock()
