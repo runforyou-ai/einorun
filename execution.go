@@ -371,10 +371,43 @@ func (e *execution) buildTools(ctx context.Context, scope AgentScope) ([]tool.Ba
 			}
 			item = created
 		}
-		tools = append(tools, item)
+		invoked, err := invokedOnly(item)
+		if err != nil {
+			return nil, releases, err
+		}
+		tools = append(tools, invoked)
 	}
 	return tools, releases, nil
 }
+
+// invokedOnly returns a tool that the agent invokes as a whole: the runtime
+// records, checks and hands over calls of invoked tools only, so the
+// streaming side of a tool that also streams is hidden, and a tool that only
+// streams is refused.
+func invokedOnly(item tool.BaseTool) (tool.BaseTool, error) {
+	_, streams := item.(tool.StreamableTool)
+	_, streamsEnhanced := item.(tool.EnhancedStreamableTool)
+	if !streams && !streamsEnhanced {
+		return item, nil
+	}
+	if enhanced, ok := item.(tool.EnhancedInvokableTool); ok {
+		return enhancedInvoked{enhanced}, nil
+	}
+	if invokable, ok := item.(tool.InvokableTool); ok {
+		return invoked{invokable}, nil
+	}
+	name := "?"
+	if info, err := item.Info(context.Background()); err == nil {
+		name = info.Name
+	}
+	return nil, fmt.Errorf("einorun: tool %s only streams its result; register an invokable tool", name)
+}
+
+// invoked exposes only the invokable side of a tool.
+type invoked struct{ tool.InvokableTool }
+
+// enhancedInvoked exposes only the enhanced invokable side of a tool.
+type enhancedInvoked struct{ tool.EnhancedInvokableTool }
 
 // declareTool registers a tool an extension's middleware adds to the main
 // agent, so that its calls are recorded with the spec's traits.
@@ -509,6 +542,15 @@ func (e *execution) buildAgent(ctx context.Context, a *agent, instruction string
 	}
 	handlers = append(handlers, &rawCapture{agent: a})
 	middlewares := slices.Concat(outer, []compose.ToolMiddleware{e.toolMiddleware(a)}, inner)
+	if a.scope.Main {
+		a.tools = map[string]tool.BaseTool{}
+		for _, item := range tools {
+			if info, err := item.Info(ctx); err == nil {
+				a.tools[info.Name] = item
+			}
+		}
+		a.chain = slices.Concat([]compose.ToolMiddleware{e.toolMiddleware(a)}, inner, handlerToolMiddlewares(handlers))
+	}
 	built, err := adk.NewTypedChatModelAgent(ctx, &adk.TypedChatModelAgentConfig[*schema.AgenticMessage]{
 		Name: a.scope.Name, Instruction: instruction, Model: chatModel,
 		ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{
@@ -1001,7 +1043,7 @@ func (e *execution) restore(ctx context.Context) (bool, error) {
 			if !ok {
 				continue
 			}
-			if result, ok := modelResult(record); ok {
+			if result, ok := modelResult(record, e.text); ok {
 				e.patched[c.CallID] = result
 				// Media of a result that never reached the model is passed again.
 				if len(record.Media) > 0 {
@@ -1042,7 +1084,28 @@ func (e *execution) restore(ctx context.Context) (bool, error) {
 		}
 		e.lastClaim = claim
 	}
-	return false, nil
+	// Decided calls are carried out last, once the run's state is restored:
+	// running one may save a checkpoint.
+	if last := len(messages) - 1; last >= 0 && messages[last].Role == schema.AgenticRoleTypeAssistant {
+		records := map[string]*ToolCall{}
+		for _, b := range blocks {
+			if b.Call != nil {
+				records[b.Call.CallID] = b.Call
+			}
+		}
+		carried, err := e.carryOutDecisions(ctx, messages[last], records)
+		if err != nil {
+			return false, err
+		}
+		// What carrying out the decisions changed is saved like a batch.
+		if carried {
+			if err := e.save(ctx); err != nil {
+				return false, err
+			}
+		}
+	}
+	// An approved call may hand itself over to an external executor.
+	return e.recorder.awaiting(), nil
 }
 
 // restoreExtensions restores the state of stateful extensions. The
@@ -1128,6 +1191,12 @@ func settleInterrupted(blocks []Block, children []ToolCall, at time.Time, text *
 		if call.Status.Settled() || call.Handover == HandoverDetached || call.Handover == HandoverSubmitted {
 			return
 		}
+		// A paused call waits for its decision, then the runtime carries it
+		// out; only main-agent calls pause.
+		if main && paused(call) {
+			waiting = waiting || call.Decision == nil
+			return
+		}
 		if call.Handover == HandoverAwait {
 			waiting = waiting || main
 			return
@@ -1165,8 +1234,18 @@ func interrupted(replayable, sideEffects bool, text *Text) (CallStatus, string) 
 }
 
 // modelResult returns what the model sees for a call record: a receipt, the
-// error or the result.
-func modelResult(call *ToolCall) (string, bool) {
+// error or the result, preceded by the changed arguments of a call approved
+// with them.
+func modelResult(call *ToolCall, text *Text) (string, bool) {
+	result, ok := recordResult(call)
+	if ok && call.Decision != nil && call.Decision.Approved && call.Decision.Arguments != "" {
+		result = fmt.Sprintf(text.CallEdited, call.Decision.Arguments) + result
+	}
+	return result, ok
+}
+
+// recordResult returns the receipt, the error or the result of a call record.
+func recordResult(call *ToolCall) (string, bool) {
 	switch {
 	case call.Handover == HandoverDetached || call.Handover == HandoverSubmitted:
 		if call.Result != nil {

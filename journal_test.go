@@ -23,7 +23,7 @@ func TestSettled(t *testing.T) {
 			t.Fatalf("%s settled", s)
 		}
 	}
-	for _, s := range []CallStatus{StatusSucceeded, StatusFailed, StatusInterrupted, StatusNeedsReview, "rejected"} {
+	for _, s := range []CallStatus{StatusSucceeded, StatusFailed, StatusInterrupted, StatusNeedsReview, StatusRejected, "expired"} {
 		if !s.Settled() {
 			t.Fatalf("%s not settled", s)
 		}

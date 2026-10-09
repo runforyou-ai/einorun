@@ -34,8 +34,8 @@ type JournalHarness struct {
 	Load func(ctx context.Context) (einorun.Resume, error)
 	// External applies a write the host makes outside the runtime, with
 	// einorun.OverlayExternal semantics: Status, Result, Error, Media,
-	// CompletedAt, Handover and Payload when set. The suite only uses it on
-	// calls that exist.
+	// CompletedAt, Handover, Payload and Decision when set. The suite only
+	// uses it on calls that exist.
 	External func(ctx context.Context, update einorun.ToolCall) error
 	// Call returns the stored record of a call, main or sub-agent, and false
 	// when there is none.
@@ -61,6 +61,7 @@ func RunJournal(t *testing.T, newHarness func(t *testing.T) JournalHarness) {
 		{"stale writes do not fill a handover", testStaleHandoverFill},
 		{"non-handover writes do not fill a receipt", testNonHandoverFill},
 		{"notes follow revisions", testNotes},
+		{"decisions are the host's", testDecision},
 		{"steps", testSteps},
 		{"blocks link to merged calls", testBlockLinks},
 		{"concurrent writes to one call", testConcurrentOneCall},
@@ -244,6 +245,8 @@ func differ(a, b einorun.ToolCall) string {
 		return "Replayable or SideEffects"
 	case !maps.Equal(a.Notes, b.Notes):
 		return "Notes"
+	case (a.Decision == nil) != (b.Decision == nil) || (a.Decision != nil && *a.Decision != *b.Decision):
+		return "Decision"
 	case !sameTime(a.StartedAt, b.StartedAt) || !sameTime(a.CompletedAt, b.CompletedAt):
 		return "times"
 	}
@@ -413,6 +416,32 @@ func testNonHandoverFill(t *testing.T, h JournalHarness, n ids) {
 	got := find(t, h, n)
 	if got.Result != nil || got.Status != einorun.StatusQueued {
 		t.Fatalf("a settlement became the receipt: %+v", got)
+	}
+}
+
+func testDecision(t *testing.T, h JournalHarness, n ids) {
+	paused := child(n, "a", 1, einorun.StatusAwaitingDecision)
+	paused.Payload = json.RawMessage(`{"op":1}`)
+	save(t, h, paused)
+	decision := einorun.CallDecision{Approved: true, Arguments: `{"x":2}`}
+	external(t, h, einorun.ToolCall{ID: n.of("a"), Decision: &decision})
+	got := find(t, h, n)
+	if got.Decision == nil || *got.Decision != decision || got.Status != einorun.StatusAwaitingDecision {
+		t.Fatalf("decision not stored: %+v", got)
+	}
+	// The runtime carries the decision out; its snapshots never change it.
+	running := child(n, "a", 2, einorun.StatusRunning)
+	save(t, h, running)
+	got = find(t, h, n)
+	if got.Status != einorun.StatusRunning || got.Decision == nil || *got.Decision != decision {
+		t.Fatalf("a runtime snapshot dropped the decision or kept the status: %+v", got)
+	}
+	done := child(n, "a", 3, einorun.StatusSucceeded)
+	done.Result, done.CompletedAt, done.Decision = text("ok"), &at, &einorun.CallDecision{Reason: "other"}
+	save(t, h, done)
+	got = find(t, h, n)
+	if got.Status != einorun.StatusSucceeded || got.Decision == nil || *got.Decision != decision {
+		t.Fatalf("a runtime snapshot replaced the decision: %+v", got)
 	}
 }
 

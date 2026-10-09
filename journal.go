@@ -69,12 +69,19 @@ func RejectCall(reason string) error { return &CallRejection{Reason: reason} }
 //     win. Blocks only link to their call; the call itself is written through
 //     Calls or SaveToolCall.
 //   - Writes the host makes outside the runtime (dispatching to an external
-//     executor, settling an external call, deciding a submission) are
-//     authoritative; OverlayExternal describes them.
+//     executor, settling an external call, deciding a submission, deciding a
+//     paused call) are authoritative; OverlayExternal describes them.
 //   - SaveToolCall that submits a call for a decision (Handover
 //     HandoverSubmitted) is where the host creates the submission, in the same
 //     transaction. It returns an error wrapping ErrCallRejected to refuse it,
-//     and then must not have persisted the write.
+//     and then must not have persisted the write. The same holds for a call
+//     the runtime pauses for a decision (Status StatusAwaitingDecision with
+//     HandoverNone, see CallPolicy.Confirm): its first write is where the host
+//     creates the pending decision, and refusing it fails the call.
+//     The host decides a paused call by writing its Decision; the run then
+//     resumes and carries the decision out. A decision is final once written:
+//     the host does not change it, and, as for any resume, runs one execution
+//     of a run at a time, so a decision is carried out once.
 //     A host that notifies reviewers of calls needing review does so when the
 //     merged record newly reaches StatusNeedsReview, not because the incoming
 //     snapshot says so.
@@ -112,6 +119,8 @@ func (c ToolCall) Validate() error {
 //     snapshot that hands the call over too fills in the payload if there is
 //     none and the receipt while the call has neither a result nor an error.
 //     Status and times stay the host's.
+//   - The decision is the host's: a stored decision stays, and a snapshot's
+//     decision is taken only when none is stored.
 func MergeCall(stored *ToolCall, incoming ToolCall) ToolCall {
 	if stored == nil {
 		return incoming.Clone()
@@ -126,6 +135,9 @@ func MergeCall(stored *ToolCall, incoming ToolCall) ToolCall {
 	merged.Name, merged.Arguments = in.Name, in.Arguments
 	merged.Replayable, merged.SideEffects = in.Replayable, in.SideEffects
 	merged.Notes = in.Notes
+	if merged.Decision == nil {
+		merged.Decision = in.Decision
+	}
 	switch {
 	case stored.Handover != HandoverNone:
 		// The host handed the call over first, possibly settling it already;
@@ -148,8 +160,9 @@ func MergeCall(stored *ToolCall, incoming ToolCall) ToolCall {
 }
 
 // OverlayExternal returns stored with a write the host makes outside the
-// runtime applied: Status, Result, Error, Media, CompletedAt, Handover and
-// Payload come from update when set (a non-nil empty Media clears the media);
+// runtime applied: Status, Result, Error, Media, CompletedAt, Handover,
+// Payload and Decision come from update when set (a non-nil empty Media clears
+// the media);
 // Rev and every other field are kept. It describes the authoritative writes
 // the Journal contract refers to.
 func OverlayExternal(stored ToolCall, update ToolCall) ToolCall {
@@ -175,6 +188,9 @@ func OverlayExternal(stored ToolCall, update ToolCall) ToolCall {
 	}
 	if len(u.Payload) > 0 {
 		merged.Payload = u.Payload
+	}
+	if u.Decision != nil {
+		merged.Decision = u.Decision
 	}
 	return merged
 }

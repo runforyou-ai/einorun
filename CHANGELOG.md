@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Calls can pause for a decision: `CallPolicy.Confirm` records the call as `awaiting_decision` and suspends the run; the host writes `ToolCall.Decision` (approve, approve with changed arguments, or reject with a reason), and on resume the runtime carries it out within the same turn. New `StatusRejected`; `MergeCall` keeps the host's decision and `OverlayExternal` writes it; `journaltest` checks it; new texts `CannotConfirm`, `CallRejected` and `CallEdited`.
+
 ## 0.1.0 - 2026-10-09
 
 First release.

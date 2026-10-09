@@ -88,6 +88,10 @@ type CallPolicy struct {
 	// Submit, when set, submits the call for a decision by the host instead
 	// of executing it.
 	Submit *Submission
+	// Confirm, when set, pauses the run for a decision on the call before it
+	// runs. Only main-agent calls that can suspend pause; elsewhere the call
+	// fails. Submit and Confirm are exclusive.
+	Confirm *Confirmation
 	// Replayable and SideEffects, when set, override the spec's traits.
 	Replayable  *bool
 	SideEffects *bool
@@ -100,6 +104,16 @@ type CallPolicy struct {
 // Receipt as the call's result.
 type Submission struct {
 	Receipt string
+	Payload json.RawMessage
+}
+
+// Confirmation pauses a call for a decision by the host. The call is
+// recorded with StatusAwaitingDecision and Payload, the run suspends after the
+// current batch, and the host decides by writing the call's Decision (see
+// Journal). When the run resumes, the runtime carries the decision out within
+// the same turn: an approved call runs, with the decision's arguments when
+// set, and a rejected call gives the model the reason.
+type Confirmation struct {
 	Payload json.RawMessage
 }
 
