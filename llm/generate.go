@@ -31,15 +31,17 @@ type OutputSchema struct {
 	Schema *jsonschema.Schema
 }
 
-// SchemaFor derives an OutputSchema from the JSON fields of T. Fields are
-// required; fields tagged jsonschema:"nullable" may be null; descriptions come
-// from jsonschema_description tags.
+// SchemaFor derives an OutputSchema from the JSON fields of T. Every field is
+// required, including omitempty fields; fields tagged jsonschema:"nullable" may
+// be null; descriptions come from jsonschema_description tags.
 func SchemaFor[T any]() *OutputSchema {
 	t := reflect.TypeFor[T]()
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
-	reflector := &jsonschema.Reflector{Anonymous: true, DoNotReference: true, ExpandedStruct: true}
+	// Expanding the root needs a type name; anonymous structs are reflected
+	// inline, which DoNotReference makes equivalent.
+	reflector := &jsonschema.Reflector{Anonymous: true, DoNotReference: true, ExpandedStruct: t.Name() != ""}
 	s := reflector.ReflectFromType(t)
 	s.Version = ""
 	normalizeSchema(s)
@@ -51,7 +53,9 @@ func SchemaFor[T any]() *OutputSchema {
 }
 
 // normalizeSchema rewrites oneOf as anyOf, which every provider's structured
-// output accepts.
+// output accepts, and makes every property of every object required, as
+// strict structured output demands (omitempty does not make a field
+// optional).
 func normalizeSchema(s *jsonschema.Schema) {
 	if s == nil {
 		return
@@ -64,7 +68,9 @@ func normalizeSchema(s *jsonschema.Schema) {
 	}
 	normalizeSchema(s.Items)
 	if s.Properties != nil {
+		s.Required = s.Required[:0]
 		for pair := s.Properties.Oldest(); pair != nil; pair = pair.Next() {
+			s.Required = append(s.Required, pair.Key)
 			normalizeSchema(pair.Value)
 		}
 	}
@@ -89,7 +95,7 @@ type GenerateResult struct {
 }
 
 // Generate calls the model once with a system instruction and one user
-// message.
+// message. The call's context carries a new ModelCallID.
 func Generate(ctx context.Context, factory ModelFactory, request GenerateRequest) (GenerateResult, error) {
 	return generate(ctx, factory, request, nil)
 }
@@ -109,7 +115,7 @@ func generate(ctx context.Context, factory ModelFactory, request GenerateRequest
 			}},
 			schema.UserAgenticMessage(fmt.Sprintf(prompt.For(string(request.Language)).StructuredRetry, previous.problem)))
 	}
-	message, err := m.Generate(ctx, messages)
+	message, err := m.Generate(WithModelCallID(ctx, NewModelCallID()), messages)
 	if err != nil {
 		return GenerateResult{}, err
 	}
@@ -126,7 +132,7 @@ type retry struct {
 // it. When the provider supports structured output the model is constrained;
 // otherwise the instruction carries the format and the first JSON object in
 // the text is decoded. Text that does not decode is retried once with the
-// decode error. Validating field values is up to the caller. The usage of all
+// decode error. Every attempt gets its own ModelCallID. Validating field values is up to the caller. The usage of all
 // attempts is returned, also with an error.
 func GenerateObject[T any](ctx context.Context, factory ModelFactory, request GenerateRequest) (T, Usage, error) {
 	var zero T
@@ -157,12 +163,12 @@ func GenerateObject[T any](ctx context.Context, factory ModelFactory, request Ge
 	}
 }
 
-// DecodeObject decodes the JSON object spanning from the first { to the last }
-// of text into target, tolerating code fences and surrounding prose.
+// DecodeObject decodes the first JSON object of text, which starts at the first
+// {, into target, tolerating code fences and surrounding prose.
 func DecodeObject(text string, target any) error {
-	start, end := strings.Index(text, "{"), strings.LastIndex(text, "}")
-	if start < 0 || end < start {
+	start := strings.Index(text, "{")
+	if start < 0 {
 		return errors.New("llm: no JSON object in model output")
 	}
-	return json.Unmarshal([]byte(text[start:end+1]), target)
+	return json.NewDecoder(strings.NewReader(text[start:])).Decode(target)
 }

@@ -83,3 +83,20 @@ func TestMerge(t *testing.T) {
 		t.Fatal("merged deltas that do not connect")
 	}
 }
+
+func TestMergeOperationsIsolation(t *testing.T) {
+	// A malformed upsert next to another upsert does not panic.
+	ops := MergeOperations([]Operation{{Kind: OpUpsertBlock, Block: &Block{ID: "b"}}, {Kind: OpUpsertBlock}})
+	if len(ops) != 2 {
+		t.Fatalf("ops %+v", ops)
+	}
+	call := &CallView{CallID: "c", Status: "running"}
+	plan := []PlanTask{{ID: "1"}}
+	in := []Operation{{Kind: OpUpsertBlock, Block: &Block{ID: "b", Call: call}}, {Kind: OpSetPlan, Plan: plan}}
+	merged := MergeOperations(in)
+	merged[0].Block.Call.Status = "done"
+	merged[1].Plan[0].ID = "2"
+	if call.Status != "running" || plan[0].ID != "1" {
+		t.Fatal("merged operations share memory with their input")
+	}
+}

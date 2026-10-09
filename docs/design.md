@@ -146,27 +146,35 @@ type Step struct {
 ```
 
 - Every call record carries a revision `Rev` the runtime increments on each
-  change. Journals write a call only when its `Rev` is higher than the stored
-  one, so a stale snapshot inside a `Step` never overwrites a newer
-  `SaveToolCall`, even across a crash.
-- Settled statuses are never replaced by unsettled ones. Results written by
-  the host outside the runtime are authoritative.
-- Handing a call over (see Ownership) freezes its outcome. If the host already
-  recorded a handover (for example when its dispatch transaction committed
-  before the tool returned), the runtime's handover write only fills in the
-  payload and, while there is no result yet, the receipt; it never moves the
-  host's `queued`/`running` or final status. Notes are still merged later.
-- Notes are merged by key; for a key both writes carry, the higher `Rev` wins.
-  The runtime and guards add or change notes, they never delete them.
+  change, and every call the runtime writes is a complete snapshot of the
+  record at that revision, notes included. Journals ignore a write whose `Rev`
+  is not above the stored one, so a stale snapshot inside a `Step` never
+  overwrites a newer `SaveToolCall`, even across a crash.
+- A newer snapshot replaces the descriptive fields and the notes. It replaces
+  the outcome only while the call is neither settled nor handed over: settled
+  outcomes are final, whatever status a newer write carries, and results
+  written by the host outside the runtime are authoritative
+  (`OverlayExternal` describes such writes).
+- If the host already recorded a handover (for example when its dispatch
+  transaction committed before the tool returned), a newer runtime snapshot
+  that hands the call over too only fills in the payload if there is none and
+  the receipt while the call has neither a result nor an error; it never moves
+  the host's `queued`/`running` or final status.
+- Calls need an ID and a status. `Step.Changes` are incremental; `Usage`,
+  `Plan`, `Completion` and `State` are the run's current values and replace
+  the stored ones. Blocks only link to their call.
 - `SaveStep` calls are sequential; `SaveToolCall` may run concurrently with
   each other and with `SaveStep`.
 - Calls the runtime settles during recovery are written one by one with
   `SaveToolCall`, so hosts can notify reviewers.
+- Hosts that notify reviewers do so when the merged record newly needs
+  review.
 - `MergeCall` implements these rules for journals that keep records as
   documents; SQL journals implement them in their upsert. `journaltest` checks
-  persisted results: out-of-order and repeated writes, stale snapshots, frozen
+  persisted results: out-of-order and repeated writes, stale snapshots, final
   outcomes, host-first handovers, external results arriving before the
-  handover write, note merging and concurrency.
+  handover write, stale or non-handover writes that must not fill a receipt,
+  notes, steps and removals, block links and concurrent writes to one call.
 
 ### Ownership
 

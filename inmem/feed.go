@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
+	"maps"
 	"sync"
 
 	"github.com/runforyou-ai/einorun"
@@ -27,7 +27,7 @@ func NewFeed() *Feed {
 // Append adds a message and returns its sequence number.
 func (f *Feed) Append(message einorun.Message) int64 {
 	f.mu.Lock()
-	f.messages = append(f.messages, message)
+	f.messages = append(f.messages, cloneMessage(message))
 	seq := int64(len(f.messages))
 	for ch := range f.watchers {
 		select {
@@ -67,7 +67,7 @@ func (f *Feed) Watch(context.Context) (<-chan struct{}, func(), error) {
 func (f *Feed) Pending(_ context.Context, after int64) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if latest := int64(len(f.messages)); latest > after {
+	if latest := int64(len(f.messages)); latest > max(after, f.consumed) {
 		return latest, nil
 	}
 	return 0, nil
@@ -85,5 +85,19 @@ func (f *Feed) Claim(_ context.Context, through int64) (einorun.Claim, error) {
 	if end <= f.consumed {
 		return einorun.Claim{}, fmt.Errorf("inmem: input up to %d is already consumed", f.consumed)
 	}
-	return einorun.Claim{Messages: slices.Clone(f.messages[:end]), EndSeq: end}, nil
+	messages := make([]einorun.Message, end)
+	for i, m := range f.messages[:end] {
+		messages[i] = cloneMessage(m)
+	}
+	return einorun.Claim{Messages: messages, EndSeq: end}, nil
+}
+
+// cloneMessage copies the media reference and meta of m.
+func cloneMessage(m einorun.Message) einorun.Message {
+	if m.Media != nil {
+		media := *m.Media
+		m.Media = &media
+	}
+	m.Meta = maps.Clone(m.Meta)
+	return m
 }

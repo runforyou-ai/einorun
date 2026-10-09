@@ -130,6 +130,10 @@ type Snapshot struct {
 // the snapshot's sequence (a duplicate), ErrMismatch when d belongs to another
 // stream and ErrGap when d does not start at the snapshot's sequence. When an
 // operation cannot be applied the snapshot is left unchanged.
+//
+// Duplicates are recognized by sequence alone, so a new execution attempt must
+// use a new Stream: deltas of an attempt that reuses the identifier and starts
+// again at 1 would be taken for duplicates.
 func (s *Snapshot) Apply(d Delta) (bool, error) {
 	if d.Stream != s.Stream {
 		return false, ErrMismatch
@@ -204,23 +208,25 @@ func MergeDeltas(earlier, later Delta) (Delta, bool) {
 
 // MergeOperations folds adjacent operations that can be combined: text
 // appended to the same block, candidate appends, repeated upserts of the same
-// block and repeated plan updates.
+// block and repeated plan updates. The result shares no memory with ops.
+// Malformed operations, such as an upsert without a block, are kept as they
+// are for Apply to reject.
 func MergeOperations(ops []Operation) []Operation {
 	merged := make([]Operation, 0, len(ops))
 	for _, op := range ops {
+		op = op.clone()
 		if n := len(merged); n > 0 {
 			last := &merged[n-1]
+			upsert := last.Kind == OpUpsertBlock && last.Block != nil
 			switch {
 			case op.Kind == OpAppendText && last.Kind == OpAppendText && last.BlockID == op.BlockID,
 				op.Kind == OpAppendCandidate && last.Kind == OpAppendCandidate:
 				last.Text += op.Text
 				continue
-			case op.Kind == OpAppendText && last.Kind == OpUpsertBlock && last.Block.ID == op.BlockID:
-				block := *last.Block
-				block.Text += op.Text
-				last.Block = &block
+			case op.Kind == OpAppendText && upsert && last.Block.ID == op.BlockID:
+				last.Block.Text += op.Text
 				continue
-			case op.Kind == OpUpsertBlock && last.Kind == OpUpsertBlock && last.Block.ID == op.Block.ID:
+			case op.Kind == OpUpsertBlock && op.Block != nil && upsert && last.Block.ID == op.Block.ID:
 				last.Block = op.Block
 				continue
 			case op.Kind == OpSetPlan && last.Kind == OpSetPlan:
@@ -231,6 +237,17 @@ func MergeOperations(ops []Operation) []Operation {
 		merged = append(merged, op)
 	}
 	return merged
+}
+
+// clone copies the block, block IDs and plan of op.
+func (op Operation) clone() Operation {
+	if op.Block != nil {
+		block := op.Block.clone()
+		op.Block = &block
+	}
+	op.BlockIDs = slices.Clone(op.BlockIDs)
+	op.Plan = slices.Clone(op.Plan)
+	return op
 }
 
 // TextBytes returns the number of text bytes the delta carries, so relays can

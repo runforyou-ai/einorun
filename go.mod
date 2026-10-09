@@ -5,6 +5,7 @@ go 1.27.0
 require (
 	github.com/cloudwego/eino v0.10.0-alpha.35
 	github.com/eino-contrib/jsonschema v1.0.3
+	github.com/google/uuid v1.6.0
 )
 
 require (

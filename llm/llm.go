@@ -9,6 +9,7 @@ import (
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
+	"github.com/google/uuid"
 )
 
 // Language selects the language of the model-facing text einorun writes.
@@ -93,6 +94,11 @@ type modelCallIDKey struct{}
 // be made.
 func WithModelCallID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, modelCallIDKey{}, id)
+}
+
+// NewModelCallID returns a new model call ID, a UUIDv7.
+func NewModelCallID() string {
+	return uuid.Must(uuid.NewV7()).String()
 }
 
 // ModelCallID returns the model call ID carried by ctx, or "" when there is none.

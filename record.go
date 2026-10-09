@@ -62,10 +62,12 @@ const (
 	StatusNeedsReview CallStatus = "needs_review"
 )
 
-// Settled reports whether the call has a final outcome.
+// Settled reports whether the call has a final outcome. Statuses the runtime
+// does not know are the host's own final statuses; the empty status is not a
+// status at all and is not settled.
 func (s CallStatus) Settled() bool {
 	switch s {
-	case StatusQueued, StatusRunning, StatusWaiting, StatusAwaitingDecision:
+	case "", StatusQueued, StatusRunning, StatusWaiting, StatusAwaitingDecision:
 		return false
 	}
 	return true
@@ -143,8 +145,8 @@ type ToolCall struct {
 	// submitted; journals store it as is.
 	Payload    json.RawMessage
 	Completion *CallCompletion
-	// Notes are annotations by tool specs, guards and extensions, merged by
-	// key.
+	// Notes are annotations by tool specs, guards and extensions. The runtime
+	// only adds or changes notes, so every snapshot carries all of them.
 	Notes map[string]string
 }
 

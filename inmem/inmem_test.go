@@ -15,6 +15,7 @@ func TestJournal(t *testing.T) {
 		return journaltest.JournalHarness{
 			Journal:  j,
 			Load:     func(context.Context) (einorun.Resume, error) { return j.Resume(), nil },
+			Usage:    func(context.Context) (einorun.Usage, error) { return j.Usage(), nil },
 			External: j.External,
 		}
 	})

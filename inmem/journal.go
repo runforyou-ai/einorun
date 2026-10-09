@@ -5,6 +5,7 @@ package inmem
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"sync"
 
@@ -29,6 +30,11 @@ func NewJournal() *Journal {
 
 // SaveStep applies a step.
 func (j *Journal) SaveStep(_ context.Context, step einorun.Step) error {
+	for _, call := range step.Changes.Calls {
+		if err := call.Validate(); err != nil {
+			return err
+		}
+	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	for _, id := range step.Changes.RemovedBlocks {
@@ -41,8 +47,8 @@ func (j *Journal) SaveStep(_ context.Context, step einorun.Step) error {
 		j.mergeLocked(call)
 	}
 	for _, block := range step.Changes.Blocks {
+		// Blocks only link to their call.
 		if block.Call != nil {
-			j.mergeLocked(*block.Call)
 			block.Call = &einorun.ToolCall{ID: block.Call.ID}
 		}
 		j.blocks[block.ID] = block
@@ -56,6 +62,9 @@ func (j *Journal) SaveStep(_ context.Context, step einorun.Step) error {
 
 // SaveToolCall merges one call.
 func (j *Journal) SaveToolCall(_ context.Context, call einorun.ToolCall) error {
+	if err := call.Validate(); err != nil {
+		return err
+	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.mergeLocked(call)
@@ -63,16 +72,17 @@ func (j *Journal) SaveToolCall(_ context.Context, call einorun.ToolCall) error {
 }
 
 // External applies a write made outside the runtime, as a host does when it
-// dispatches a call to an external executor or settles it. The fields of call
-// replace the stored record except Rev, which is kept.
-func (j *Journal) External(_ context.Context, call einorun.ToolCall) error {
+// dispatches a call to an external executor or settles it, with
+// einorun.OverlayExternal semantics.
+func (j *Journal) External(_ context.Context, update einorun.ToolCall) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if stored, ok := j.calls[call.ID]; ok {
-		call.Rev = stored.Rev
+	stored, ok := j.calls[update.ID]
+	if !ok {
+		return fmt.Errorf("inmem: no call %s", update.ID)
 	}
-	clone := call.Clone()
-	j.calls[call.ID] = &clone
+	merged := einorun.OverlayExternal(*stored, update)
+	j.calls[update.ID] = &merged
 	return nil
 }
 

@@ -124,3 +124,49 @@ func TestModelCallID(t *testing.T) {
 		t.Fatal("model call id")
 	}
 }
+
+func TestSchemaForRequiresOmitempty(t *testing.T) {
+	type withOptional struct {
+		Title string `json:"title,omitempty"`
+		Inner struct {
+			N int `json:"n,omitempty"`
+		} `json:"inner"`
+	}
+	s := SchemaFor[withOptional]()
+	if len(s.Schema.Required) != 2 {
+		t.Fatalf("required %v", s.Schema.Required)
+	}
+	inner, _ := s.Schema.Properties.Get("inner")
+	if len(inner.Required) != 1 {
+		t.Fatalf("inner required %v", inner.Required)
+	}
+}
+
+func TestDecodeObjectTrailingText(t *testing.T) {
+	var got answer
+	if err := DecodeObject("Here: {\"title\":\"x\",\"note\":null} (see {braces})", &got); err != nil || got.Title != "x" {
+		t.Fatalf("%+v %v", got, err)
+	}
+}
+
+// recording records the ModelCallID of every call.
+type recording struct {
+	scripted
+	ids []string
+}
+
+func (r *recording) Generate(ctx context.Context, input []*schema.AgenticMessage, opts ...model.Option) (*schema.AgenticMessage, error) {
+	r.ids = append(r.ids, ModelCallID(ctx))
+	return r.scripted.Generate(ctx, input, opts...)
+}
+
+func TestModelCallIDPerAttempt(t *testing.T) {
+	r := &recording{scripted: scripted{replies: []*schema.AgenticMessage{reply("bad", 1, 1), reply(`{"title":"t","note":null}`, 1, 1)}}}
+	factory := func(context.Context, ModelOptions) (model.AgenticModel, error) { return r, nil }
+	if _, _, err := GenerateObject[answer](WithModelCallID(context.Background(), "caller"), factory, GenerateRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.ids) != 2 || r.ids[0] == "" || r.ids[0] == r.ids[1] || r.ids[0] == "caller" {
+		t.Fatalf("ids %v", r.ids)
+	}
+}
