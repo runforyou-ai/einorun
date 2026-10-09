@@ -194,35 +194,29 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 		return x.pause(ctx, a, input, entry, policy)
 	}
 	now := time.Now()
-	write := x.update
 	if policy.Submit != nil {
-		write = x.handOver
+		record, refusal, err := x.handOver(ctx, a, input, func(call *ToolCall) {
+			call.Arguments = input.Arguments
+			applyPolicy(call, policy)
+			receipt := policy.Submit.Receipt
+			call.Status, call.Handover, call.Result, call.Payload = StatusAwaitingDecision, HandoverSubmitted, &receipt, policy.Submit.Payload
+			call.StartedAt = &now
+		})
+		if refusal != nil || err != nil {
+			return refusal, err
+		}
+		x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: record, Raw: policy.Submit.Receipt, Origin: OriginSubmitted})
+		return text(policy.Submit.Receipt)
 	}
-	record, err := write(ctx, a, input, func(call *ToolCall) {
+	record, err := x.update(ctx, a, input, func(call *ToolCall) {
 		// A decided call keeps the arguments the model gave; the decision
 		// records the ones it ran with.
 		if decision == nil {
 			call.Arguments = input.Arguments
 		}
 		applyPolicy(call, policy)
-		if policy.Submit != nil {
-			receipt := policy.Submit.Receipt
-			call.Status, call.Handover, call.Result, call.Payload = StatusAwaitingDecision, HandoverSubmitted, &receipt, policy.Submit.Payload
-			call.StartedAt = &now
-			return
-		}
 		call.Status, call.StartedAt = StatusRunning, &now
 	})
-	if policy.Submit != nil {
-		if refused, ok := x.refused(ctx, a, input, err); ok {
-			return refused()
-		}
-		if err != nil {
-			return nil, err
-		}
-		x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: record, Raw: policy.Submit.Receipt, Origin: OriginSubmitted})
-		return text(policy.Submit.Receipt)
-	}
 	if err != nil {
 		return nil, err
 	}
@@ -328,16 +322,13 @@ func (x *execution) pause(ctx context.Context, a *agent, input *compose.ToolInpu
 	case !a.scope.Main || (entry != nil && entry.spec.Completion) || !confirmable(a.tools[input.Name]):
 		return fail(errors.New(x.text.CannotConfirm))
 	}
-	call, err := x.handOver(ctx, a, input, func(call *ToolCall) {
+	call, refusal, err := x.handOver(ctx, a, input, func(call *ToolCall) {
 		call.Arguments = input.Arguments
 		applyPolicy(call, policy)
 		call.Status, call.Payload = StatusAwaitingDecision, policy.Confirm.Payload
 	})
-	if refused, ok := x.refused(ctx, a, input, err); ok {
-		return refused()
-	}
-	if err != nil {
-		return nil, err
+	if refusal != nil || err != nil {
+		return refusal, err
 	}
 	x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: call, Origin: OriginExecuted})
 	// The run suspends after the batch; the model never sees this result.
@@ -433,12 +424,40 @@ func (x *execution) finishWith(ctx context.Context, a *agent, input *compose.Too
 }
 
 // handOver writes a call the host takes a decision on. No step is saved
-// meanwhile, so the host sees the call first through SaveToolCall, where it
-// creates the pending decision or refuses it.
-func (x *execution) handOver(ctx context.Context, a *agent, input *compose.ToolInput, change func(*ToolCall)) (ToolCall, error) {
+// until the write is settled, so the host sees the call first through
+// SaveToolCall, where it creates the pending decision or refuses it, and no
+// step carries a hand-over the host did not take: a refusal fails the call
+// and returns what the model sees; any other error fails the call in memory
+// and aborts the run.
+func (x *execution) handOver(ctx context.Context, a *agent, input *compose.ToolInput, change func(*ToolCall)) (ToolCall, *string, error) {
 	x.saveMu.Lock()
 	defer x.saveMu.Unlock()
-	return x.update(ctx, a, input, change)
+	call, err := x.update(ctx, a, input, change)
+	if err == nil {
+		return call, nil, nil
+	}
+	if refused, ok := x.refused(ctx, a, input, err); ok {
+		result, err := refused()
+		return ToolCall{}, result, err
+	}
+	message := err.Error()
+	x.amend(a, input, func(call *ToolCall) {
+		done := time.Now()
+		call.Status, call.Handover, call.Payload, call.Result, call.Error, call.CompletedAt = StatusFailed, HandoverNone, nil, nil, &message, &done
+	})
+	return ToolCall{}, nil, err
+}
+
+// amend changes the record of a call of agent a in memory, a call that was
+// just written; the next step writes it.
+func (x *execution) amend(a *agent, input *compose.ToolInput, change func(*ToolCall)) {
+	if a.scope.Main {
+		_, _ = x.recorder.changeCall(input.CallID, change)
+		return
+	}
+	if parent, ok := x.recorder.mainCall(a.parentCallID); ok {
+		_, _ = x.recorder.changeChild(parent.ID, input.CallID, change)
+	}
 }
 
 // update changes the record of a call of agent a and writes it. A

@@ -382,10 +382,20 @@ func (r *recorder) finalize(ctx context.Context, message *schema.AgenticMessage)
 // updateCall applies update to the main-agent call with the provider call ID,
 // publishes it and writes it to the journal.
 func (r *recorder) updateCall(ctx context.Context, providerCallID string, update func(*ToolCall)) (ToolCall, error) {
+	saved, err := r.changeCall(providerCallID, update)
+	if err != nil {
+		return ToolCall{}, err
+	}
+	return saved, r.journal.SaveToolCall(ctx, saved)
+}
+
+// changeCall applies update to the main-agent call with the provider call ID
+// and publishes it; the next step writes it.
+func (r *recorder) changeCall(providerCallID string, update func(*ToolCall)) (ToolCall, error) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	position, ok := r.toolPositions[providerCallID]
 	if !ok {
-		r.mu.Unlock()
 		return ToolCall{}, fmt.Errorf("einorun: call %q has no model output", providerCallID)
 	}
 	call := r.process[position].Call
@@ -394,10 +404,8 @@ func (r *recorder) updateCall(ctx context.Context, providerCallID string, update
 	if call.Status.Settled() {
 		delete(r.activity, call.ID)
 	}
-	saved := call.Clone()
 	r.pub.add(stream.Operation{Kind: stream.OpUpsertBlock, Block: r.view(r.process[position])})
-	r.mu.Unlock()
-	return saved, r.journal.SaveToolCall(ctx, saved)
+	return call.Clone(), nil
 }
 
 // mainCall returns a copy of the main-agent call with the provider call ID.
@@ -446,18 +454,25 @@ func (r *recorder) childPosition(parentID, providerCallID string) (int, bool) {
 
 // updateChild applies update to a sub-agent call and writes it.
 func (r *recorder) updateChild(ctx context.Context, parentID, providerCallID string, update func(*ToolCall)) (ToolCall, error) {
+	saved, err := r.changeChild(parentID, providerCallID, update)
+	if err != nil {
+		return ToolCall{}, err
+	}
+	return saved, r.journal.SaveToolCall(ctx, saved)
+}
+
+// changeChild applies update to a sub-agent call; the next step writes it.
+func (r *recorder) changeChild(parentID, providerCallID string, update func(*ToolCall)) (ToolCall, error) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	index, ok := r.childPositions[parentID+"/"+providerCallID]
 	if !ok {
-		r.mu.Unlock()
 		return ToolCall{}, fmt.Errorf("einorun: sub-agent call %q is unknown", providerCallID)
 	}
 	call := &r.children[index]
 	update(call)
 	r.touchLocked(call)
-	saved := call.Clone()
-	r.mu.Unlock()
-	return saved, r.journal.SaveToolCall(ctx, saved)
+	return call.Clone(), nil
 }
 
 // childCalls returns copies of the sub-agent calls.

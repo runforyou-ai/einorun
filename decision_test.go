@@ -306,6 +306,14 @@ func TestApprovedCallThatAwaitsSuspendsWithItsState(t *testing.T) {
 	if again := resume(t, request, journal); !again.Suspended {
 		t.Fatalf("approved call that awaits did not suspend: %+v", again)
 	}
+	// The checkpoint holds the outcome of carrying the decision out, after
+	// the pause's.
+	var checkpoint struct {
+		Extensions map[string]json.RawMessage `json:"extensions"`
+	}
+	if err := json.Unmarshal(journal.Resume().State, &checkpoint); err != nil || string(checkpoint.Extensions["outcomes"]) != "2" {
+		t.Fatalf("checkpoint extensions %s %v", checkpoint.Extensions["outcomes"], err)
+	}
 	// The outcome the extension saw while carrying out the decision is saved.
 	restored := &outcomes{}
 	request.Extensions = []einorun.Extension{restored}
@@ -418,5 +426,68 @@ func TestPauseIsObserved(t *testing.T) {
 		Tools: []einorun.ToolSpec{{Tool: echo("pay"), Policy: confirmed}}, Extensions: []einorun.Extension{seen}})
 	if err != nil || !result.Suspended || seen.count != 1 {
 		t.Fatalf("result %+v err %v outcomes %d", result, err, seen.count)
+	}
+}
+
+// streamed is a tool that both invokes and streams.
+type streamed struct{ fn }
+
+func (s *streamed) StreamableRun(context.Context, string, ...tool.Option) (*schema.StreamReader[string], error) {
+	return schema.StreamReaderFromArray([]string{"streamed"}), nil
+}
+
+func TestStreamingToolsPauseLikeInvokedOnes(t *testing.T) {
+	m := &scripted{steps: []step{call(invocation{"pay", `{}`})}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "pay")
+	result, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed,
+		Tools: []einorun.ToolSpec{{Tool: &streamed{*echo("pay")}, Policy: confirmed}}})
+	if err != nil || !result.Suspended || result.Blocks[0].Call.Status != einorun.StatusAwaitingDecision {
+		t.Fatalf("result %+v err %v", result, err)
+	}
+}
+
+// onlyStreams is a tool that only streams.
+type onlyStreams struct{}
+
+func (onlyStreams) Info(context.Context) (*schema.ToolInfo, error) {
+	return &schema.ToolInfo{Name: "stream", Desc: "stream"}, nil
+}
+
+func (onlyStreams) StreamableRun(context.Context, string, ...tool.Option) (*schema.StreamReader[string], error) {
+	return schema.StreamReaderFromArray([]string{"x"}), nil
+}
+
+func TestToolsThatOnlyStreamAreRefused(t *testing.T) {
+	m := &scripted{steps: []step{say("hi")}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "hi")
+	_, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed, Tools: []einorun.ToolSpec{{Tool: onlyStreams{}}}})
+	if err == nil || !strings.Contains(err.Error(), "only streams") {
+		t.Fatalf("err %v", err)
+	}
+}
+
+// failingHandOver fails the write of every call paused for a decision.
+type failingHandOver struct{ *inmem.Journal }
+
+func (j failingHandOver) SaveToolCall(ctx context.Context, call einorun.ToolCall) error {
+	if call.Status == einorun.StatusAwaitingDecision {
+		return errors.New("database down")
+	}
+	return j.Journal.SaveToolCall(ctx, call)
+}
+
+func TestFailedHandOverIsNotLeftHandedOver(t *testing.T) {
+	m := &scripted{steps: []step{call(invocation{"pay", `{}`})}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "pay")
+	result, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed, Journal: failingHandOver{inmem.NewJournal()},
+		Tools: []einorun.ToolSpec{{Tool: echo("pay"), Policy: confirmed}}})
+	if err == nil || !strings.Contains(err.Error(), "database down") {
+		t.Fatalf("err %v", err)
+	}
+	if call := result.Blocks[0].Call; call.Status != einorun.StatusFailed {
+		t.Fatalf("call %+v", call)
 	}
 }

@@ -371,10 +371,43 @@ func (e *execution) buildTools(ctx context.Context, scope AgentScope) ([]tool.Ba
 			}
 			item = created
 		}
-		tools = append(tools, item)
+		invoked, err := invokedOnly(item)
+		if err != nil {
+			return nil, releases, err
+		}
+		tools = append(tools, invoked)
 	}
 	return tools, releases, nil
 }
+
+// invokedOnly returns a tool that the agent invokes as a whole: the runtime
+// records, checks and hands over calls of invoked tools only, so the
+// streaming side of a tool that also streams is hidden, and a tool that only
+// streams is refused.
+func invokedOnly(item tool.BaseTool) (tool.BaseTool, error) {
+	_, streams := item.(tool.StreamableTool)
+	_, streamsEnhanced := item.(tool.EnhancedStreamableTool)
+	if !streams && !streamsEnhanced {
+		return item, nil
+	}
+	if enhanced, ok := item.(tool.EnhancedInvokableTool); ok {
+		return enhancedInvoked{enhanced}, nil
+	}
+	if invokable, ok := item.(tool.InvokableTool); ok {
+		return invoked{invokable}, nil
+	}
+	name := "?"
+	if info, err := item.Info(context.Background()); err == nil {
+		name = info.Name
+	}
+	return nil, fmt.Errorf("einorun: tool %s only streams its result; register an invokable tool", name)
+}
+
+// invoked exposes only the invokable side of a tool.
+type invoked struct{ tool.InvokableTool }
+
+// enhancedInvoked exposes only the enhanced invokable side of a tool.
+type enhancedInvoked struct{ tool.EnhancedInvokableTool }
 
 // declareTool registers a tool an extension's middleware adds to the main
 // agent, so that its calls are recorded with the spec's traits.
