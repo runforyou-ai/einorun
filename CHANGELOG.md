@@ -2,7 +2,11 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-10-10
+
 - Calls can pause for a decision: `CallPolicy.Confirm` records the call as `awaiting_decision` and suspends the run; the host writes `ToolCall.Decision` (approve, approve with changed arguments, or reject with a reason), and on resume the runtime carries it out within the same turn. New `StatusRejected`; `MergeCall` keeps the host's decision and `OverlayExternal` writes it; `journaltest` checks it; new texts `CannotConfirm`, `CallRejected` and `CallEdited`.
+- Registered tools are invoked as a whole: the streaming side of a tool that also streams is hidden, and a tool that only streams is refused, so every call goes through recording, policies and pausing.
+- A submission or pause the host refuses, or whose write fails, is settled as failed before any step can carry it.
 
 ## 0.1.0 - 2026-10-09
 
