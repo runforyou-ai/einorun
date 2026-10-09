@@ -55,7 +55,8 @@ type Claim struct {
 //     input has not been consumed; the runtime relies on this to replay its
 //     last claim after a restart.
 //   - Claim fails when the snapshot is empty or the boundary is at or below
-//     the input already consumed.
+//     the input already consumed. Claiming what Pending reported moves the
+//     claimed boundary forward; a claim that does not fails the run.
 type Feed interface {
 	Watch(ctx context.Context) (signals <-chan struct{}, stop func(), err error)
 	Pending(ctx context.Context, after int64) (int64, error)

@@ -67,7 +67,8 @@ built-in prompts is a process-wide setting; hosts set it once at start-up with
 Zero values: `MaxIterations <= 0` means 20 per turn (reset when new input is
 claimed; a correction rerun keeps the remaining budget); `MaxTurns == 0` means
 no limit; `Corrections <= 0` means 1; a nil `Journal` means an in-memory
-journal; `ContextWindow <= 0` means 32000.
+journal (`MemoryJournal`, also offered as `inmem.Journal`); `ContextWindow <= 0`
+means 32000.
 
 ### Outcome
 
@@ -88,7 +89,7 @@ returns, in all three cases.
 | Source | Handling |
 |---|---|
 | A tool's ordinary error, unparsable arguments, an error from a spec's `Policy` | The call fails, the model sees `{"error": ...}`, the run continues |
-| `Correctable(err)` from a completion tool | Same, and one correction is used (see Completion) |
+| Any error from a completion tool | Same, and one correction is used (see Completion) |
 | `Await`, `Detached`, `Complete` | Control results, see below |
 | `SaveToolCall` returns an error wrapping `ErrCallRejected` | The call fails with the reason, the run continues |
 | Any other `Feed` or `Journal` error, context cancellation, framework interrupts | The run aborts; the error chain is kept with `%w` |
@@ -121,9 +122,9 @@ type Message struct {
   revision enters again. Claimed history is kept within 50% of the context
   window, newest first, always keeping the newest message.
 - Replay: after a restart the runtime claims its checkpointed boundary again
-  and expects the same `EndSeq`. Advance: a normal claim whose `EndSeq` is not
-  above the runtime's claimed boundary means there is no new input; the
-  runtime does not start a turn and does not fail. A `Feed` fails a claim
+  and expects the same `EndSeq`. Advance: `Pending` only reports input that
+  can be claimed, so a normal claim must move the boundary forward; a claim
+  that does not breaks the contract and fails the run. A `Feed` fails a claim
   whose snapshot is empty or whose boundary is at or below the input the host
   already consumed.
 - Claiming binds input to the run; it is not consumption. Hosts consume input
@@ -273,7 +274,7 @@ type CompletionPolicy struct { Fallback func(reason string) json.RawMessage }
   pending: it is dropped from the model history (the process record keeps it)
   and the next turn starts. A fixed completion is never superseded; no further
   input is claimed and the run ends. Fallback completions are fixed.
-- Corrections: batch violations, `Correctable` errors of completion tools and
+- Corrections: batch violations, errors of completion tools and
   guard corrections share `Limits.Corrections`, which is checkpointed. A
   remaining correction is used first. When the output is invalid again with no
   correction left, or still invalid at the end of the iteration budget, the
@@ -320,7 +321,9 @@ type Verdict struct {
 - A correction reruns the turn with the rejected text and the prompt; neither
   enters later history. The rerun keeps the remaining iteration budget and
   does not count as a turn. Without corrections left the completion fallback
-  applies.
+  applies; without a fallback the run fails with `ErrGuardRejected`.
+- `Request.Guard` may be one of the request's extensions; for an
+  `Instantiable` extension the run's instance reviews.
 
 ## Tools
 
@@ -346,7 +349,7 @@ type Submission struct { Receipt string; Payload json.RawMessage }
 and its release function runs when that agent ends. At execution time tools
 use `CallFrom(ctx)` (record ID, model call ID, provider call ID),
 `CanSuspend(ctx)` / `WithoutSuspend(ctx)`, and return `Await`, `Detached`,
-`Complete`, `Correctable` or `MediaResult(text, refs...)`.
+or `Complete`, or return media results (see Media).
 
 ### Execution order
 
