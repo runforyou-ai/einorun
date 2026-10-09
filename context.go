@@ -19,6 +19,7 @@ import (
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 
+	"github.com/runforyou-ai/einorun/internal/prompt"
 	"github.com/runforyou-ai/einorun/llm"
 )
 
@@ -152,13 +153,13 @@ type offloadStore struct {
 	files map[string]string
 }
 
-// Write stores a file and remembers it.
+// Write stores a file and remembers it, atomically for snapshots.
 func (s *offloadStore) Write(ctx context.Context, req *filesystem.WriteRequest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.InMemoryBackend.Write(ctx, req); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.files[req.FilePath] = req.Content
 	return nil
 }
@@ -249,6 +250,7 @@ type summarizer struct {
 	counter func(ctx context.Context, messages []*schema.AgenticMessage, tools []*schema.ToolInfo) (int64, error)
 	pin     func(messages []*schema.AgenticMessage) map[string]bool
 	runID   string
+	text    *prompt.Runtime
 
 	mu         sync.Mutex
 	keepFromID string
@@ -286,6 +288,7 @@ func (e *execution) newSummarizer(ctx context.Context, summaryModel model.Agenti
 		counter:                       p.TokenCounter,
 		pin:                           e.pinned,
 		runID:                         e.request.RunID,
+		text:                          e.text,
 	}, nil
 }
 
@@ -328,7 +331,7 @@ func (s *summarizer) BeforeModelRewriteState(ctx context.Context, state *adk.Typ
 	}
 	latest, round := -1, -1
 	for i := start; i < len(state.Messages); i++ {
-		if adk.GetMessageID(state.Messages[i]) == keepFromID {
+		if keepFromID != "" && adk.GetMessageID(state.Messages[i]) == keepFromID {
 			latest = i
 		}
 		if state.Messages[i].Role == schema.AgenticRoleTypeAssistant && hasToolCalls(state.Messages[i]) {
@@ -386,8 +389,9 @@ func (s *summarizer) BeforeModelRewriteState(ctx context.Context, state *adk.Typ
 	if len(summarize) == 0 || (len(summarize) == 1 && summarize[0].Extra[summaryExtraKey] == true) {
 		return ctx, state, nil
 	}
+	// The summary model reads text only.
 	prefix := *state
-	prefix.Messages = append(slices.Clone(system), summarize...)
+	prefix.Messages = append(slices.Clone(system), withoutMedia(summarize, s.text)...)
 	summarized, err := s.inner.Summarize(ctx, &prefix)
 	if err != nil {
 		return ctx, nil, err
@@ -432,13 +436,14 @@ func splitPinned(message *schema.AgenticMessage, pinned map[string]bool) (*schem
 	return &schema.AgenticMessage{Role: message.Role, ContentBlocks: keep}, restMessage
 }
 
-// pinned returns the calls kept verbatim by summaries: calls of tools that pin
-// their results, and calls extensions pin.
+// pinned returns the calls kept verbatim by summaries: read-backs of
+// offloaded results, calls of tools that pin their results, and calls
+// extensions pin.
 func (e *execution) pinned(messages []*schema.AgenticMessage) map[string]bool {
 	ids := map[string]bool{}
 	for _, m := range messages {
 		for _, c := range toolCalls(m) {
-			if entry, ok := e.recorder.entry(c.Name); ok && entry.spec.PinInSummary {
+			if entry, ok := e.recorder.entry(c.Name); (ok && entry.spec.PinInSummary) || c.Name == OffloadReadTool {
 				ids[c.CallID] = true
 			}
 		}
@@ -461,12 +466,23 @@ func (h *history) compact(event *compaction, intermediates []*schema.AgenticMess
 		}
 		return intermediates
 	}
+	makes := func(m *schema.AgenticMessage) bool {
+		return m.Role == schema.AgenticRoleTypeAssistant && slices.ContainsFunc(toolCalls(m), func(c *schema.FunctionToolCall) bool { return c.CallID == event.keepFromCallID })
+	}
 	for i, m := range intermediates {
-		if m.Role == schema.AgenticRoleTypeAssistant && slices.ContainsFunc(toolCalls(m), func(c *schema.FunctionToolCall) bool { return c.CallID == event.keepFromCallID }) {
+		if makes(m) {
 			h.messages = append([]*schema.AgenticMessage{event.summary}, event.kept...)
 			return intermediates[i:]
 		}
 	}
+	// After recovery the kept round may already be in the history.
+	for i, m := range h.messages {
+		if makes(m) {
+			h.messages = slices.Concat([]*schema.AgenticMessage{event.summary}, event.kept, h.messages[i:])
+			return intermediates
+		}
+	}
+	slog.Warn("einorun: summary anchor not found, the history keeps the full context", "call_id", event.keepFromCallID)
 	return intermediates
 }
 

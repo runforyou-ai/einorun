@@ -24,19 +24,8 @@ import (
 // result, by the provider call ID.
 const mediaExtraKey = "einorun_media_for"
 
-// WithMedia is returned by tools whose result includes media the host
-// stores: text is the result and refs the media, in order. The refs are
-// saved with the call; the runtime reads the media back before the next model
-// call and passes it to the model within the run's media budget.
-func WithMedia(text string, refs ...MediaRef) error {
-	return &control{media: &mediaResult{text: text, refs: slices.Clone(refs)}}
-}
-
-// mediaResult is a result with media.
-type mediaResult struct {
-	text string
-	refs []MediaRef
-}
+// errMediaChanged reports media whose digest no longer matches its reference.
+var errMediaChanged = errors.New("einorun: media changed since it was referenced")
 
 // readMedia reads media and checks its digest when the reference has one.
 func readMedia(ctx context.Context, read MediaReader, ref MediaRef) ([]byte, error) {
@@ -50,7 +39,7 @@ func readMedia(ctx context.Context, read MediaReader, ref MediaRef) ([]byte, err
 	if ref.SHA256 != "" {
 		sum := sha256.Sum256(data)
 		if !strings.EqualFold(hex.EncodeToString(sum[:]), ref.SHA256) {
-			return nil, fmt.Errorf("einorun: media %s changed since it was referenced", ref.Key)
+			return nil, fmt.Errorf("%w: %s", errMediaChanged, ref.Key)
 		}
 	}
 	return data, nil
@@ -84,8 +73,9 @@ func resultPart(modality llm.Modality, data []byte, mime string) *schema.Functio
 
 // mediaInjector passes the media of tool results to the model before the
 // next model call: inside the tool result when the model accepts media there,
-// otherwise as a user message right after it. Media the model cannot view,
-// cannot be read or exceeds the budget becomes a note.
+// otherwise as a user message right after it. Newer media is chosen first
+// within the run's budget; media that cannot be passed becomes a note saying
+// why.
 type mediaInjector struct {
 	adk.TypedBaseChatModelAgentMiddleware[*schema.AgenticMessage]
 	policy   mediaPolicy
@@ -128,19 +118,50 @@ func (m *mediaInjector) restore(pending map[string][]MediaRef) {
 	}
 }
 
+// item is one piece of media of a ready call and what becomes of it.
+type item struct {
+	ref      MediaRef
+	modality llm.Modality
+	data     []byte
+	note     string
+}
+
 // BeforeModelRewriteState passes pending media whose tool results are in the
-// context.
+// context. Media is read outside the lock.
 func (m *mediaInjector) BeforeModelRewriteState(ctx context.Context, state *adk.TypedChatModelAgentState[*schema.AgenticMessage], _ *adk.TypedModelContext[*schema.AgenticMessage]) (context.Context, *adk.TypedChatModelAgentState[*schema.AgenticMessage], error) {
+	var order []string
+	taken := map[string][]MediaRef{}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.pending) == 0 {
+	for _, message := range state.Messages {
+		for _, id := range resultCallIDs(message) {
+			if refs, ok := m.pending[id]; ok {
+				taken[id] = refs
+				order = append(order, id)
+				delete(m.pending, id)
+			}
+		}
+	}
+	m.mu.Unlock()
+	if len(order) == 0 {
 		return ctx, state, nil
 	}
-	messages := make([]*schema.AgenticMessage, 0, len(state.Messages)+len(m.pending))
+	// Read newest first, so the budget keeps the latest media.
+	items := map[string][]*item{}
+	for i := len(order) - 1; i >= 0; i-- {
+		refs := taken[order[i]]
+		loaded := make([]*item, len(refs))
+		for j := len(refs) - 1; j >= 0; j-- {
+			loaded[j] = m.load(ctx, refs[j])
+		}
+		items[order[i]] = loaded
+	}
+	messages := make([]*schema.AgenticMessage, 0, len(state.Messages)+len(order))
+	injected := map[string]*schema.AgenticMessage{}
+	results := map[string]*schema.AgenticMessage{}
 	for _, message := range state.Messages {
 		var ready []string
 		for _, id := range resultCallIDs(message) {
-			if _, ok := m.pending[id]; ok {
+			if _, ok := items[id]; ok {
 				ready = append(ready, id)
 			}
 		}
@@ -149,95 +170,94 @@ func (m *mediaInjector) BeforeModelRewriteState(ctx context.Context, state *adk.
 			continue
 		}
 		if m.inResult {
-			message = m.intoResults(ctx, message, ready)
+			message = intoResults(message, ready, items)
+			for _, id := range ready {
+				results[id] = message
+			}
 			messages = append(messages, message)
 			continue
 		}
 		messages = append(messages, message)
 		for _, id := range ready {
-			carrier := m.carrier(ctx, id, m.pending[id])
-			m.injected[id] = carrier
-			delete(m.pending, id)
+			carrier := &schema.AgenticMessage{Role: schema.AgenticRoleTypeUser, Extra: map[string]any{mediaExtraKey: id}}
+			for _, it := range items[id] {
+				if it.data != nil {
+					carrier.ContentBlocks = append(carrier.ContentBlocks, inputBlock(it.modality, it.data, it.ref.MIME))
+				} else {
+					carrier.ContentBlocks = append(carrier.ContentBlocks, schema.NewContentBlock(&schema.UserInputText{Text: it.note}))
+				}
+			}
+			injected[id] = carrier
 			messages = append(messages, carrier)
 		}
 	}
+	m.mu.Lock()
+	maps.Copy(m.injected, injected)
+	if len(results) > 0 {
+		if m.results == nil {
+			m.results = map[string]*schema.AgenticMessage{}
+		}
+		maps.Copy(m.results, results)
+	}
+	m.mu.Unlock()
 	state.Messages = messages
 	return ctx, state, nil
 }
 
 // intoResults adds the media of the ready calls to their result blocks.
-func (m *mediaInjector) intoResults(ctx context.Context, message *schema.AgenticMessage, ready []string) *schema.AgenticMessage {
+func intoResults(message *schema.AgenticMessage, ready []string, items map[string][]*item) *schema.AgenticMessage {
 	copied := *message
 	copied.ContentBlocks = slices.Clone(message.ContentBlocks)
 	for i, b := range copied.ContentBlocks {
 		if b == nil || b.Type != schema.ContentBlockTypeFunctionToolResult || !slices.Contains(ready, b.FunctionToolResult.CallID) {
 			continue
 		}
-		id := b.FunctionToolResult.CallID
 		result := *b.FunctionToolResult
 		result.Content = slices.Clone(result.Content)
-		for _, ref := range m.pending[id] {
-			if part, note := m.load(ctx, ref); part != nil {
-				result.Content = append(result.Content, resultPart(part.modality, part.data, ref.MIME))
+		for _, it := range items[result.CallID] {
+			if it.data != nil {
+				result.Content = append(result.Content, resultPart(it.modality, it.data, it.ref.MIME))
 			} else {
-				result.Content = append(result.Content, &schema.FunctionToolResultContentBlock{Type: schema.FunctionToolResultContentBlockTypeText, Text: &schema.UserInputText{Text: note}})
+				result.Content = append(result.Content, &schema.FunctionToolResultContentBlock{Type: schema.FunctionToolResultContentBlockTypeText, Text: &schema.UserInputText{Text: it.note}})
 			}
 		}
 		block := *b
 		block.FunctionToolResult = &result
 		copied.ContentBlocks[i] = &block
-		delete(m.pending, id)
-	}
-	for _, id := range ready {
-		if m.results == nil {
-			m.results = map[string]*schema.AgenticMessage{}
-		}
-		m.results[id] = &copied
 	}
 	return &copied
 }
 
-// carrier returns the user message carrying the media of a call.
-func (m *mediaInjector) carrier(ctx context.Context, callID string, refs []MediaRef) *schema.AgenticMessage {
-	message := &schema.AgenticMessage{Role: schema.AgenticRoleTypeUser, Extra: map[string]any{mediaExtraKey: callID}}
-	for _, ref := range refs {
-		if part, note := m.load(ctx, ref); part != nil {
-			message.ContentBlocks = append(message.ContentBlocks, inputBlock(part.modality, part.data, ref.MIME))
-		} else {
-			message.ContentBlocks = append(message.ContentBlocks, schema.NewContentBlock(&schema.UserInputText{Text: note}))
-		}
-	}
-	return message
-}
-
-// loaded is media read for the model.
-type loaded struct {
-	modality llm.Modality
-	data     []byte
-}
-
-// load reads media the model can view within the budget, or returns the note
-// that replaces it.
-func (m *mediaInjector) load(ctx context.Context, ref MediaRef) (*loaded, string) {
+// load reads media the model can view within the budget, charged by the bytes
+// actually read, or returns the note that replaces it.
+func (m *mediaInjector) load(ctx context.Context, ref MediaRef) *item {
+	it := &item{ref: ref}
 	modality, ok := inlineTypes[ref.MIME]
-	note := fmt.Sprintf(m.text.MediaUnavailable, cmpOr(ref.MIME, "media"))
 	if !ok || !m.policy.modalities[modality] || !m.policy.enabled.Load() || m.policy.read == nil {
-		return nil, note
-	}
-	if !m.policy.budget.reserve(ref.Size, m.policy.maxCount) {
-		return nil, note
+		it.note = fmt.Sprintf(m.text.MediaUnavailable, cmpOr(ref.MIME, "media"))
+		return it
 	}
 	data, err := readMedia(ctx, m.policy.read, ref)
-	if err != nil {
-		m.policy.budget.release(ref.Size)
+	switch {
+	case errors.Is(err, errMediaChanged):
+		it.note = fmt.Sprintf(m.text.MediaChanged, ref.Key)
+		return it
+	case err != nil:
 		slog.WarnContext(ctx, "einorun: reading tool result media failed", "key", ref.Key, "error", err)
-		return nil, note
+		it.note = fmt.Sprintf(m.text.MediaUnavailable, ref.MIME)
+		return it
 	}
-	return &loaded{modality: modality, data: data}, ""
+	if !m.policy.budget.reserve(int64(len(data)), m.policy.maxCount) {
+		it.note = fmt.Sprintf(m.text.MediaOverBudget, ref.Key)
+		return it
+	}
+	it.modality, it.data = modality, data
+	return it
 }
 
 // apply puts the passed media into the turn history the same way: carrier
-// messages after their results, or result messages with media inside.
+// messages after their results, or result messages with media inside. With
+// media turned off, the history keeps notes only.
 func (m *mediaInjector) apply(messages []*schema.AgenticMessage) []*schema.AgenticMessage {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -266,6 +286,9 @@ func (m *mediaInjector) apply(messages []*schema.AgenticMessage) []*schema.Agent
 				present[id] = true
 			}
 		}
+	}
+	if !m.policy.enabled.Load() {
+		return withoutMedia(out, m.text)
 	}
 	return out
 }

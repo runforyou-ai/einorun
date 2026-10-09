@@ -514,6 +514,9 @@ func (e *execution) genInput(ctx context.Context, _ *adk.TurnLoop[trigger, *sche
 		messages = e.history.appendInput(ctx, trimHistory(ctx, claim.Messages, e.window), e.media)
 		e.summarizers[0].keepFrom(messages[len(messages)-1])
 	case e.correction != "" || len(e.rejected) > 0:
+		if !e.media.enabled.Load() {
+			e.history.messages = withoutMedia(e.history.messages, e.text)
+		}
 		messages = slices.Concat(e.history.messages, e.rejected, []*schema.AgenticMessage{schema.UserAgenticMessage(e.correction)})
 		e.rejected, e.correction = nil, ""
 		e.budget.carryBudget()
@@ -842,6 +845,7 @@ func (e *execution) restore(ctx context.Context) (bool, error) {
 		messages = messages[:last]
 	}
 	// Results of the last output's calls come from the latest records.
+	restoredMedia := map[string][]MediaRef{}
 	if last := len(messages) - 1; last >= 0 && messages[last].Role == schema.AgenticRoleTypeAssistant {
 		records := map[string]*ToolCall{}
 		for _, b := range blocks {
@@ -858,7 +862,7 @@ func (e *execution) restore(ctx context.Context) (bool, error) {
 				e.patched[c.CallID] = result
 				// Media of a result that never reached the model is passed again.
 				if len(record.Media) > 0 {
-					e.injector.add(c.CallID, record.Media)
+					restoredMedia[c.CallID] = record.Media
 				}
 				e.observe(ctx, CallOutcome{Agent: e.main.scope, Name: c.Name, Call: record.Clone(), Raw: result, Origin: OriginRestored})
 			}
@@ -876,6 +880,9 @@ func (e *execution) restore(ctx context.Context) (bool, error) {
 	}
 	e.media.budget.restore(s.MediaCount, s.MediaBytes)
 	e.injector.restore(s.MediaPending)
+	for id, refs := range restoredMedia {
+		e.injector.add(id, refs)
+	}
 	e.turns = s.Turns
 	e.media.enabled.Store(s.MediaEnabled)
 	e.budget.resume(s.Iterations)

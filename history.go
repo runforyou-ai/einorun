@@ -72,14 +72,6 @@ func (b *mediaBudget) reserve(size int64, maxCount int) bool {
 	return true
 }
 
-// release gives back the room of an item that could not be sent.
-func (b *mediaBudget) release(size int64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.count--
-	b.bytes -= size
-}
-
 // used returns the items and bytes sent.
 func (b *mediaBudget) used() (int, int64) {
 	b.mu.Lock()
@@ -129,12 +121,11 @@ func (h *history) appendInput(ctx context.Context, messages []Message, media med
 				continue
 			}
 			modality, ok := inlineTypes[ref.MIME]
-			if !ok || !media.modalities[modality] || !media.budget.reserve(ref.Size, media.maxCount) {
+			if !ok || !media.modalities[modality] {
 				continue
 			}
-			message, ok := mediaMessage(ctx, fresh[i], modality, media.read)
-			if !ok {
-				media.budget.release(ref.Size)
+			message, size, ok := mediaMessage(ctx, fresh[i], modality, media.read)
+			if !ok || !media.budget.reserve(size, media.maxCount) {
 				continue
 			}
 			inline[i] = message
@@ -155,16 +146,16 @@ func (h *history) appendInput(ctx context.Context, messages []Message, media med
 }
 
 // mediaMessage reads an attachment and returns a user message with its text
-// and the media; false when it cannot be read.
-func mediaMessage(ctx context.Context, m Message, modality llm.Modality, read MediaReader) (*schema.AgenticMessage, bool) {
+// and the media, and the bytes read; false when it cannot be read.
+func mediaMessage(ctx context.Context, m Message, modality llm.Modality, read MediaReader) (*schema.AgenticMessage, int64, bool) {
 	data, err := readMedia(ctx, read, *m.Media)
 	if err != nil {
 		slog.WarnContext(ctx, "einorun: reading an attachment failed, keeping its link only", "message_id", m.ID, "error", err)
-		return nil, false
+		return nil, 0, false
 	}
 	return &schema.AgenticMessage{Role: schema.AgenticRoleTypeUser, ContentBlocks: []*schema.ContentBlock{
 		schema.NewContentBlock(&schema.UserInputText{Text: m.Content}), inputBlock(modality, data, m.Media.MIME),
-	}}, true
+	}}, int64(len(data)), true
 }
 
 // appendOutput keeps model outputs with text or tool calls and all tool

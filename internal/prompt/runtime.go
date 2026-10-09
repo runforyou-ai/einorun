@@ -38,6 +38,12 @@ type Runtime struct {
 	// MediaUnavailable replaces media the model cannot view. %s is the media
 	// type.
 	MediaUnavailable string
+	// MediaChanged replaces media whose content changed since the tool read
+	// it. %s is the media key.
+	MediaChanged string
+	// MediaOverBudget replaces media beyond the run's media budget. %s is the
+	// media key.
+	MediaOverBudget string
 	// ListSeparator joins tool names.
 	ListSeparator string
 	// SummaryPreamble introduces a summary of earlier context.
@@ -61,6 +67,8 @@ var runtimes = map[string]*Runtime{
 		FinalNotice:           "工具调用次数已达本轮上限，请基于已获得的信息给出最终回答。",
 		FinalNoticeCompletion: "工具调用次数已达本轮上限，不能再调用其他工具。请直接给出最终回答，或单独调用 %s 结束。",
 		MediaUnavailable:      "[%s：当前模型无法查看此内容]",
+		MediaChanged:          "[%s：内容在读取后已变化，没有附上；需要时重新读取]",
+		MediaOverBudget:       "[%s：本次运行可附给模型的媒体已达上限，没有附上]",
 		ListSeparator:         "、",
 		SummaryPreamble:       "【较早对话摘要】此前的对话已压缩为以下摘要，摘要之后的消息保持原样。",
 		OffloadRead:           "读取本次运行中因结果过大而转存的工具输出，file_path 使用转存提示中给出的路径。",
@@ -79,6 +87,8 @@ var runtimes = map[string]*Runtime{
 		FinalNotice:           "The tool call limit for this turn is reached. Give your final answer based on what you have found.",
 		FinalNoticeCompletion: "The tool call limit for this turn is reached; no other tools can be called. Give your final answer, or call %s on its own to finish.",
 		MediaUnavailable:      "[%s: the current model cannot view this content]",
+		MediaChanged:          "[%s: the content changed after it was read and was not attached; read it again if needed]",
+		MediaOverBudget:       "[%s: the media limit of this run is reached; not attached]",
 		ListSeparator:         ", ",
 		SummaryPreamble:       "[Summary of earlier conversation] The conversation so far is summarized below; the messages after the summary are unchanged.",
 		OffloadRead:           "Read a tool output of this run that was offloaded because it was too large; use the file_path given in the offload note.",

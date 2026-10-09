@@ -3,8 +3,10 @@ package einorun_test
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/cloudwego/eino/components/model"
@@ -153,13 +155,15 @@ func TestToolResultMedia(t *testing.T) {
 						}
 					}
 				}
-				notes = strings.Count(texts(input), "cannot view")
+				notes = strings.Count(texts(input), "cannot view") + strings.Count(texts(input), "content changed")
 				return say("seen")(input)
 			},
 		}}
 		feed := inmem.NewFeed()
 		user(feed, "m1", "look")
-		shot := &fn{name: "screenshot", run: func(context.Context, string) (string, error) { return "", einorun.WithMedia("captured", refs...) }}
+		shot := &fn{name: "screenshot", run: func(ctx context.Context, _ string) (string, error) {
+			return "captured", einorun.AttachMedia(ctx, refs...)
+		}}
 		result, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory, Inputs: []llm.Modality{llm.Image}, ToolResultMedia: inResult},
 			Feed: feed, ReadMedia: read, Tools: []einorun.ToolSpec{{Tool: shot}}})
 		if err != nil {
@@ -172,5 +176,100 @@ func TestToolResultMedia(t *testing.T) {
 		if *call.Result != "captured" || len(call.Media) != 3 {
 			t.Fatalf("call %+v", call)
 		}
+	}
+}
+
+func TestNewestMediaWinsTheBudget(t *testing.T) {
+	data := map[string][]byte{"old": []byte("old-image"), "new": []byte("new-image")}
+	read := func(_ context.Context, ref einorun.MediaRef) ([]byte, error) { return data[ref.Key], nil }
+	var seen []string
+	m := &scripted{steps: []step{
+		call(invocation{"shot", `{"x":"old"}`}, invocation{"shot", `{"x":"new"}`}),
+		func(input []*schema.AgenticMessage) *schema.AgenticMessage {
+			for _, msg := range input {
+				for _, b := range msg.ContentBlocks {
+					if b.UserInputImage != nil {
+						seen = append(seen, b.UserInputImage.Base64Data)
+					}
+				}
+			}
+			return say("ok")(input)
+		},
+	}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "look")
+	shot := &fn{name: "shot", run: func(ctx context.Context, args string) (string, error) {
+		key := "old"
+		if strings.Contains(args, "new") {
+			key = "new"
+		}
+		return key, einorun.AttachMedia(ctx, einorun.MediaRef{Key: key, MIME: "image/png"})
+	}}
+	// A window this small allows one image per run.
+	if _, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory, ContextWindow: 6000, Inputs: []llm.Modality{llm.Image}},
+		Feed: feed, ReadMedia: read, Tools: []einorun.ToolSpec{{Tool: shot}}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 1 || seen[0] != base64.StdEncoding.EncodeToString(data["new"]) {
+		t.Fatalf("images %v", seen)
+	}
+}
+
+// stepLog keeps every saved step.
+type stepLog struct {
+	*inmem.Journal
+	mu     sync.Mutex
+	states [][]byte
+}
+
+func (j *stepLog) SaveStep(ctx context.Context, step einorun.Step) error {
+	j.mu.Lock()
+	j.states = append(j.states, step.State)
+	j.mu.Unlock()
+	return j.Journal.SaveStep(ctx, step)
+}
+
+func TestMediaSurvivesACrashBeforeTheStep(t *testing.T) {
+	image := []byte("img")
+	read := func(context.Context, einorun.MediaRef) ([]byte, error) { return image, nil }
+	m := &scripted{steps: []step{call(invocation{"shot", "{}"}, invocation{"dispatch", "{}"})}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "look")
+	journal := &stepLog{Journal: inmem.NewJournal()}
+	shot := &fn{name: "shot", run: func(ctx context.Context, _ string) (string, error) {
+		return "captured", einorun.AttachMedia(ctx, einorun.MediaRef{Key: "k", MIME: "image/png", SHA256: digest(image)})
+	}}
+	dispatch := &fn{name: "dispatch", run: func(context.Context, string) (string, error) { return "", einorun.Await(nil) }}
+	request := einorun.Request{Model: einorun.Model{New: m.factory, Inputs: []llm.Modality{llm.Image}}, Feed: feed, Journal: journal,
+		ReadMedia: read, Tools: []einorun.ToolSpec{{Tool: shot}, {Tool: dispatch}}}
+	if result, err := run(t, request); err != nil || !result.Suspended {
+		t.Fatalf("%+v %v", result, err)
+	}
+	resume := journal.Resume()
+	// Crash window: the step saved after the model output, before the tools ran.
+	resume.State = journal.states[0]
+	for i := range resume.Blocks {
+		if c := resume.Blocks[i].Call; c != nil && c.Name == "dispatch" {
+			output := "done"
+			c.Status, c.Result = einorun.StatusSucceeded, &output
+		}
+	}
+	images := 0
+	m.steps = []step{func(input []*schema.AgenticMessage) *schema.AgenticMessage {
+		for _, msg := range input {
+			for _, b := range msg.ContentBlocks {
+				if b.UserInputImage != nil {
+					images++
+				}
+			}
+		}
+		return say("ok")(input)
+	}}
+	request.Resume = &resume
+	if _, err := run(t, request); err != nil {
+		t.Fatal(err)
+	}
+	if images != 1 {
+		t.Fatalf("images after recovery %d", images)
 	}
 }

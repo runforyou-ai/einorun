@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"sync"
 
 	"github.com/cloudwego/eino/components/tool"
 )
@@ -109,6 +111,35 @@ type callContextKey struct{}
 type callMeta struct {
 	CallContext
 	suspendable bool
+	media       *callMedia
+}
+
+// callMedia collects the media a call attaches to its result.
+type callMedia struct {
+	mu   sync.Mutex
+	refs []MediaRef
+}
+
+// AttachMedia attaches media the host stores to the result of the executing
+// call, in order. The references are saved with the call; the runtime reads
+// the media back before the next model call and passes it to the model within
+// the run's media budget. It fails outside a call.
+func AttachMedia(ctx context.Context, refs ...MediaRef) error {
+	meta, ok := ctx.Value(callContextKey{}).(callMeta)
+	if !ok || meta.media == nil {
+		return errors.New("einorun: AttachMedia outside a tool call")
+	}
+	meta.media.mu.Lock()
+	defer meta.media.mu.Unlock()
+	meta.media.refs = append(meta.media.refs, refs...)
+	return nil
+}
+
+// attached returns the attached media.
+func (m *callMedia) attached() []MediaRef {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.refs)
 }
 
 // CallFrom returns the call a tool is executing, and false outside a call.
@@ -142,14 +173,11 @@ type control struct {
 	receipt    string
 	payload    json.RawMessage
 	completion *CallCompletion
-	media      *mediaResult
 }
 
 // Error describes the control result.
 func (c *control) Error() string {
 	switch {
-	case c.media != nil:
-		return "einorun: result with media"
 	case c.completion != nil:
 		return "einorun: call completes the run"
 	case c.handover == HandoverAwait:
