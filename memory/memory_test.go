@@ -134,7 +134,7 @@ func TestRecallShowsSelectedMemories(t *testing.T) {
 	}
 	input := f.agent[0]
 	system := messageText(input[0])
-	if !strings.Contains(system, "be kind") || !strings.Contains(system, "- stack: Stack — Tools in use\n- tone: Tone") {
+	if !strings.Contains(system, "be kind") || !strings.Contains(system, "- \"stack\": Stack — Tools in use\n- \"tone\": Tone") {
 		t.Fatalf("instruction %q", system)
 	}
 	reminder := messageText(input[len(input)-2])
@@ -187,6 +187,19 @@ func TestExtractNeverDeletesARewrite(t *testing.T) {
 	})
 	if err != nil || len(changes.Deleted) != 0 || len(changes.Saved) != 0 || len(changes.Skipped) != 1 {
 		t.Fatalf("changes %+v %v", changes, err)
+	}
+}
+
+func TestRecallKeepsKeysAsGiven(t *testing.T) {
+	spaced := []memory.Entry{{Key: " tone ", Name: "Tone", Description: "d", Body: "spaced body"}, {Key: "tone", Name: "Tone", Description: "d", Body: "plain body"}}
+	f := &fake{answers: []string{`{"keys":[" tone "]}`}, steps: []func() *schema.AgenticMessage{ok()}}
+	runWith(t, f, memory.Recall(source(spaced), memory.RecallOptions{}))
+	if candidates := messageText(f.structured[0][1]); !strings.Contains(candidates, `- " tone ": Tone`) || !strings.Contains(candidates, `- "tone": Tone`) {
+		t.Fatalf("candidates %q", candidates)
+	}
+	reminder := messageText(f.agent[0][len(f.agent[0])-2])
+	if !strings.Contains(reminder, "spaced body") || strings.Contains(reminder, "plain body") {
+		t.Fatalf("reminder %q", reminder)
 	}
 }
 

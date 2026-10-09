@@ -172,12 +172,12 @@ func (r *recall) Instruction(scope einorun.AgentScope) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// maxSummaryField bounds the key, name and description in index and
-// candidate lines.
+// maxSummaryField bounds the name and description in index and candidate
+// lines.
 const maxSummaryField = 400
 
-// summaryLine renders an entry as one index line: key, name and description
-// on a single line, each bounded.
+// summaryLine renders an entry as one index line: the key quoted as it is,
+// then the name and description on a single line, each bounded.
 func summaryLine(e Entry) string {
 	field := func(s string) string {
 		s = strings.Join(strings.Fields(s), " ")
@@ -186,7 +186,7 @@ func summaryLine(e Entry) string {
 		}
 		return s
 	}
-	return fmt.Sprintf("- %s: %s — %s\n", field(e.Key), field(e.Name), field(e.Description))
+	return fmt.Sprintf("- %q: %s — %s\n", e.Key, field(e.Name), field(e.Description))
 }
 
 // selection is the model's pick.
