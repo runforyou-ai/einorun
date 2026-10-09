@@ -106,6 +106,8 @@ type Request struct {
 	// which case the run's instance is used.
 	Guard      Guard
 	Extensions []Extension
+	// Context tunes context management.
+	Context ContextPolicy
 	// DiscardUndelivered drops direct text superseded by new input from the
 	// model history; the process record keeps it.
 	DiscardUndelivered bool

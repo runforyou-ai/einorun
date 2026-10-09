@@ -146,7 +146,7 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 	// A batch the completion protocol rejected does not execute.
 	if a.scope.Main {
 		if issue := x.completion.batchIssue(ctx); issue != "" {
-			call, err := x.finish(ctx, a, input, entry, "", errors.New(issue))
+			call, err := x.fail(ctx, a, input, errors.New(issue))
 			if err != nil {
 				return nil, err
 			}
@@ -159,7 +159,7 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 		var err error
 		policy, err = entry.spec.Policy(ctx, CallView{Name: input.Name, Arguments: input.Arguments, CallID: input.CallID, Agent: a.scope})
 		if err != nil {
-			call, saveErr := x.finish(ctx, a, input, entry, "", err)
+			call, saveErr := x.fail(ctx, a, input, err)
 			if saveErr != nil {
 				return nil, saveErr
 			}
@@ -206,9 +206,11 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 	if err != nil {
 		return nil, err
 	}
+	media := &callMedia{}
 	execCtx := context.WithValue(ctx, callContextKey{}, callMeta{
 		CallContext: CallContext{RecordID: record.ID, ModelCallID: record.ModelCallID, ProviderCallID: input.CallID},
 		suspendable: a.scope.Main,
+		media:       media,
 	})
 	result, execErr := execute(execCtx)
 	raw := a.raw.take(input.CallID)
@@ -218,8 +220,11 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 	// Cancellation, deadlines and framework interrupts end the run, whether
 	// they come from the run's context or from the tool's own.
 	_, interrupted := compose.ExtractInterruptInfo(execErr)
+	if abort, ok := errors.AsType[*abortError](execErr); ok {
+		return nil, abort.err
+	}
 	if interrupted || (execErr != nil && (ctx.Err() != nil || errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded))) {
-		if _, err := x.finish(ctx, a, input, entry, "", execErr); err != nil {
+		if _, err := x.fail(ctx, a, input, execErr); err != nil {
 			return nil, err
 		}
 		return nil, execErr
@@ -229,17 +234,22 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 	}
 	if execErr != nil && entry != nil && entry.spec.Completion && a.scope.Main {
 		message := x.completion.reject(ctx, execErr.Error())
-		call, err := x.finish(ctx, a, input, entry, "", execErr)
+		call, err := x.fail(ctx, a, input, execErr)
 		if err != nil {
 			return nil, err
 		}
 		x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: call, Origin: OriginExecuted})
 		return text(errorResult(errors.New(message)))
 	}
-	call, err := x.finish(ctx, a, input, entry, result, execErr)
+	var refs []MediaRef
+	if execErr == nil {
+		refs = media.attached()
+	}
+	call, err := x.finishWith(ctx, a, input, result, execErr, refs)
 	if err != nil {
 		return nil, err
 	}
+	x.injector.add(input.CallID, refs)
 	if execErr != nil {
 		slog.WarnContext(ctx, "einorun: tool call failed", "run_id", x.request.RunID, "tool", input.Name, "call_id", input.CallID, "error", execErr)
 		x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: call, Origin: OriginExecuted})
@@ -253,7 +263,7 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 func (x *execution) control(ctx context.Context, a *agent, input *compose.ToolInput, entry *toolEntry, execCtx context.Context, ctrl *control) (*string, error) {
 	text := func(s string) (*string, error) { return &s, nil }
 	fail := func(reason string) (*string, error) {
-		call, err := x.finish(ctx, a, input, entry, "", errors.New(reason))
+		call, err := x.fail(ctx, a, input, errors.New(reason))
 		if err != nil {
 			return nil, err
 		}
@@ -311,11 +321,17 @@ func (x *execution) control(ctx context.Context, a *agent, input *compose.ToolIn
 	}
 }
 
-// finish records the outcome of a call: its result, or the error the model
-// sees.
-func (x *execution) finish(ctx context.Context, a *agent, input *compose.ToolInput, _ *toolEntry, result string, callErr error) (ToolCall, error) {
+// fail records a failed call with the error the model sees.
+func (x *execution) fail(ctx context.Context, a *agent, input *compose.ToolInput, callErr error) (ToolCall, error) {
+	return x.finishWith(ctx, a, input, "", callErr, nil)
+}
+
+// finishWith records the outcome of a call with the media attached to its
+// result.
+func (x *execution) finishWith(ctx context.Context, a *agent, input *compose.ToolInput, result string, callErr error, media []MediaRef) (ToolCall, error) {
 	now := time.Now()
 	return x.update(ctx, a, input, func(call *ToolCall) {
+		call.Media = media
 		if call.StartedAt == nil {
 			call.StartedAt = &now
 		}

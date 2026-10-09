@@ -2,10 +2,10 @@ package einorun
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"slices"
+	"sync"
 	"sync/atomic"
 
 	"github.com/cloudwego/eino/schema"
@@ -43,12 +43,47 @@ var inlineTypes = map[string]llm.Modality{
 	"video/quicktime": llm.Video,
 }
 
-// mediaPolicy is how input media reaches the model.
+// mediaPolicy is how media reaches the model.
 type mediaPolicy struct {
 	read       MediaReader
 	modalities map[llm.Modality]bool
 	maxCount   int
 	enabled    *atomic.Bool // false once the model rejected media
+	budget     *mediaBudget
+}
+
+// mediaBudget counts the media sent inline in a run, shared by input
+// attachments and tool results of every agent.
+type mediaBudget struct {
+	mu    sync.Mutex
+	count int
+	bytes int64
+}
+
+// reserve takes room for one item of size, and reports whether there was any.
+func (b *mediaBudget) reserve(size int64, maxCount int) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.count >= maxCount || size > maxMediaBytes || b.bytes+size > maxRunMediaBytes {
+		return false
+	}
+	b.count++
+	b.bytes += size
+	return true
+}
+
+// used returns the items and bytes sent.
+func (b *mediaBudget) used() (int, int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.count, b.bytes
+}
+
+// restore sets the items and bytes sent.
+func (b *mediaBudget) restore(count int, bytes int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.count, b.bytes = count, bytes
 }
 
 // mediaMaxCount is the number of inline items a window allows, at least one.
@@ -59,10 +94,8 @@ func mediaMaxCount(window int) int {
 // history is the model history of a run: claimed conversation messages and
 // complete tool interactions, in order.
 type history struct {
-	messages   []*schema.AgenticMessage
-	seen       map[string]bool
-	mediaCount int
-	mediaBytes int64
+	messages []*schema.AgenticMessage
+	seen     map[string]bool
 }
 
 // appendInput adds the messages not yet in the history, by ID and revision,
@@ -84,21 +117,18 @@ func (h *history) appendInput(ctx context.Context, messages []Message, media med
 	if media.read != nil && media.enabled.Load() {
 		for i := len(fresh) - 1; i >= 0; i-- {
 			ref := fresh[i].Media
-			if ref == nil || fresh[i].Role != RoleUser || h.mediaCount >= media.maxCount ||
-				ref.Size > maxMediaBytes || h.mediaBytes+ref.Size > maxRunMediaBytes {
+			if ref == nil || fresh[i].Role != RoleUser {
 				continue
 			}
 			modality, ok := inlineTypes[ref.MIME]
 			if !ok || !media.modalities[modality] {
 				continue
 			}
-			message, ok := mediaMessage(ctx, fresh[i], modality, media.read)
-			if !ok {
+			message, size, ok := mediaMessage(ctx, fresh[i], modality, media.read)
+			if !ok || !media.budget.reserve(size, media.maxCount) {
 				continue
 			}
 			inline[i] = message
-			h.mediaCount++
-			h.mediaBytes += ref.Size
 		}
 	}
 	for i, m := range fresh {
@@ -116,28 +146,16 @@ func (h *history) appendInput(ctx context.Context, messages []Message, media med
 }
 
 // mediaMessage reads an attachment and returns a user message with its text
-// and the media; false when it cannot be read.
-func mediaMessage(ctx context.Context, m Message, modality llm.Modality, read MediaReader) (*schema.AgenticMessage, bool) {
-	data, err := read(ctx, *m.Media)
+// and the media, and the bytes read; false when it cannot be read.
+func mediaMessage(ctx context.Context, m Message, modality llm.Modality, read MediaReader) (*schema.AgenticMessage, int64, bool) {
+	data, err := readMedia(ctx, read, *m.Media)
 	if err != nil {
 		slog.WarnContext(ctx, "einorun: reading an attachment failed, keeping its link only", "message_id", m.ID, "error", err)
-		return nil, false
-	}
-	encoded := base64.StdEncoding.EncodeToString(data)
-	var block *schema.ContentBlock
-	switch modality {
-	case llm.Image:
-		block = schema.NewContentBlock(&schema.UserInputImage{Base64Data: encoded, MIMEType: m.Media.MIME})
-	case llm.Audio:
-		block = schema.NewContentBlock(&schema.UserInputAudio{Base64Data: encoded, MIMEType: m.Media.MIME})
-	case llm.Video:
-		block = schema.NewContentBlock(&schema.UserInputVideo{Base64Data: encoded, MIMEType: m.Media.MIME})
-	default:
-		return nil, false
+		return nil, 0, false
 	}
 	return &schema.AgenticMessage{Role: schema.AgenticRoleTypeUser, ContentBlocks: []*schema.ContentBlock{
-		schema.NewContentBlock(&schema.UserInputText{Text: m.Content}), block,
-	}}, true
+		schema.NewContentBlock(&schema.UserInputText{Text: m.Content}), inputBlock(modality, data, m.Media.MIME),
+	}}, int64(len(data)), true
 }
 
 // appendOutput keeps model outputs with text or tool calls and all tool

@@ -448,7 +448,10 @@ ReadMedia func(ctx context.Context, ref MediaRef) ([]byte, error)
 ```
 
 - Hosts store media bytes and namespace their keys; tools return references
-  with `MediaResult`. References are saved with the call when it settles.
+  with `AttachMedia(ctx, refs...)` and return their text as usual, so large text is still offloaded. References are saved with the call when it settles.
+- Media is charged by the bytes actually read (at most 10 MiB per item).
+  Media that cannot be passed becomes a note saying why: the model cannot
+  view it, it changed since it was read, or the budget is spent.
 - Inline formats are an allow-list (png, jpeg, webp, gif, wav variants, mp4,
   webm, quicktime) and only for modalities the model declares. Media is chosen
   newest first within 20% of the context window (1280 tokens per item, at
@@ -465,7 +468,10 @@ ReadMedia func(ctx context.Context, ref MediaRef) ([]byte, error)
 
 ## Context management
 
-Defaults: a single tool result above 10% of the window (at least 4000 bytes)
+`ContextPolicy` holds the thresholds; `CountTokens` is the default
+estimate, `OffloadReadTool` the read-back tool and `OffloadedPath` where a
+call's result is offloaded. Defaults: a single tool result above 10% of the
+window (at least 4000 bytes)
 is offloaded with a head-and-tail preview and can be read back with a tool that
 is always registered and whose results are never offloaded, cleared or
 summarized; at 75% of the window older tool calls are cleared, keeping the

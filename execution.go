@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cloudwego/eino/adk"
+	"github.com/cloudwego/eino/adk/filesystem"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
@@ -42,12 +43,15 @@ type state struct {
 	MediaCount   int                        `json:"mediaCount"`
 	MediaBytes   int64                      `json:"mediaBytes"`
 	MediaEnabled bool                       `json:"mediaEnabled"`
+	MediaPending map[string][]MediaRef      `json:"mediaPending,omitempty"`
 	ClaimedSeq   int64                      `json:"claimedSeq"`
 	Turns        int                        `json:"turns"`
 	Iterations   int                        `json:"iterations"`
 	Corrections  int                        `json:"corrections"`
 	Completion   *Completion                `json:"completion,omitempty"`
 	Usage        llm.Usage                  `json:"usage"`
+	KeepFromID   string                     `json:"keepFromId,omitempty"`
+	Offloaded    map[string]string          `json:"offloaded,omitempty"`
 	Extensions   map[string]json.RawMessage `json:"extensions,omitempty"`
 }
 
@@ -61,6 +65,7 @@ type extensionSet struct {
 	restores []RestoreObserver
 	outputs  []OutputObserver
 	stateful map[string]Stateful
+	pins     []PinProvider
 	closers  []Closer
 }
 
@@ -83,6 +88,12 @@ type execution struct {
 	releases   []func()
 	media      mediaPolicy
 	window     int
+
+	contextPolicy ContextPolicy
+	offloaded     *offloadStore
+	injector      *mediaInjector
+	summarizers   []*summarizer
+	auxiliary     []*accountedModel // models the runtime calls besides the agents'
 
 	saveMu     sync.Mutex
 	context    []*schema.AgenticMessage // model context at the latest finalized output, without the system instruction
@@ -124,6 +135,9 @@ func (r *Runtime) assemble(ctx context.Context, request Request) (*execution, er
 	e.recorder = newRecorder(e.request, streamID)
 	e.recorder.pub.start()
 	e.window = llm.ContextWindow(request.Model.ContextWindow)
+	e.contextPolicy = request.Context.withDefaults()
+	e.offloaded = &offloadStore{InMemoryBackend: filesystem.NewInMemoryBackend(), files: map[string]string{}}
+	e.offloaded.saved = func(ctx context.Context) error { return e.save(ctx) }
 	e.main = &agent{scope: AgentScope{Name: "main", Main: true}}
 
 	tools, completionTools, err := e.registerTools(ctx, e.main.scope)
@@ -152,12 +166,13 @@ func (r *Runtime) assemble(ctx context.Context, request Request) (*execution, er
 
 	enabled := &atomic.Bool{}
 	enabled.Store(true)
-	e.media = mediaPolicy{read: request.ReadMedia, modalities: map[llm.Modality]bool{}, enabled: enabled}
+	e.media = mediaPolicy{read: request.ReadMedia, modalities: map[llm.Modality]bool{}, enabled: enabled, budget: &mediaBudget{}}
 	for _, m := range request.Model.Inputs {
 		e.media.modalities[m] = true
 	}
 	e.media.maxCount = mediaMaxCount(e.window)
 	e.retry = &modelRetry{runID: request.RunID, enabled: enabled, text: text}
+	e.injector = &mediaInjector{policy: e.media, inResult: request.Model.ToolResultMedia, text: text, pending: map[string][]MediaRef{}, injected: map[string]*schema.AgenticMessage{}}
 	e.capture = &inputCapture{}
 
 	if request.Resume != nil {
@@ -230,6 +245,9 @@ func (e *execution) loadExtensions(ctx context.Context) error {
 		}
 		if c, ok := instance.(Closer); ok {
 			set.closers = append(set.closers, c)
+		}
+		if p, ok := instance.(PinProvider); ok {
+			set.pins = append(set.pins, p)
 		}
 	}
 	if set.guard == nil {
@@ -309,13 +327,38 @@ func (e *execution) buildAgent(ctx context.Context, a *agent, instruction string
 	if err != nil {
 		return nil, err
 	}
-	handlers := []adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]{
-		e.recorder, &argumentsNormalizer{}, patch, e.budget,
+	var keep, intact []string
+	for name, entry := range e.recorder.tools {
+		switch entry.spec.Retain {
+		case RetainKeep:
+			keep = append(keep, name)
+		case RetainIntact:
+			intact = append(intact, name)
+		}
 	}
+	slices.Sort(keep)
+	slices.Sort(intact)
+	reduce, err := e.reductionHandlers(ctx, e.offloaded, keep, intact)
+	if err != nil {
+		return nil, err
+	}
+	summaryModel, err := e.request.Model.New(ctx, llm.ModelOptions{MaxOutputTokens: e.contextPolicy.summaryOutput(e.window, e.request.Model.MaxOutputTokens)})
+	if err != nil {
+		return nil, err
+	}
+	accounted := &accountedModel{AgenticModel: summaryModel}
+	e.auxiliary = append(e.auxiliary, accounted)
+	summary, err := e.newSummarizer(ctx, accounted)
+	if err != nil {
+		return nil, err
+	}
+	e.summarizers = append(e.summarizers, summary)
+	handlers := slices.Concat([]adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]{e.recorder}, reduce,
+		[]adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]{&argumentsNormalizer{}, patch, summary, e.budget})
 	if len(e.completion.tools) > 0 {
 		handlers = append(handlers, e.completion)
 	}
-	handlers = append(handlers, &observerMiddleware{scope: a.scope, observers: e.extensions.outputs})
+	handlers = append(handlers, e.injector, &observerMiddleware{scope: a.scope, observers: e.extensions.outputs})
 	var outer, inner []compose.ToolMiddleware
 	for _, ext := range e.extensions.all {
 		if m, ok := ext.(ModelMiddleware); ok {
@@ -470,7 +513,11 @@ func (e *execution) genInput(ctx context.Context, _ *adk.TurnLoop[trigger, *sche
 			e.history.messages = withoutMedia(e.history.messages, e.text)
 		}
 		messages = e.history.appendInput(ctx, trimHistory(ctx, claim.Messages, e.window), e.media)
+		e.summarizers[0].keepFrom(messages[len(messages)-1])
 	case e.correction != "" || len(e.rejected) > 0:
+		if !e.media.enabled.Load() {
+			e.history.messages = withoutMedia(e.history.messages, e.text)
+		}
 		messages = slices.Concat(e.history.messages, e.rejected, []*schema.AgenticMessage{schema.UserAgenticMessage(e.correction)})
 		e.rejected, e.correction = nil, ""
 		e.budget.carryBudget()
@@ -500,6 +547,13 @@ func (e *execution) onAgentEvents(ctx context.Context, turn *adk.TurnContext[tri
 			}
 			return event.Err
 		}
+		// A summary replaced part of the context; the history follows.
+		if event.Action != nil {
+			if compacted, ok := event.Action.CustomizedAction.(*compaction); ok {
+				intermediates = e.history.compact(compacted, intermediates)
+				continue
+			}
+		}
 		if event.Output == nil || event.Output.MessageOutput == nil {
 			continue
 		}
@@ -524,6 +578,8 @@ func (e *execution) onAgentEvents(ctx context.Context, turn *adk.TurnContext[tri
 	e.saveMu.Lock()
 	e.history.fillResults(e.context)
 	e.saveMu.Unlock()
+	e.history.messages = e.injector.apply(e.history.messages)
+	e.injector.settle()
 	completion := e.completion.current()
 	text := candidate
 	if completion != nil {
@@ -673,6 +729,9 @@ func (e *execution) afterToolCalls(ctx context.Context) error {
 func (e *execution) totalUsage() llm.Usage {
 	total := e.recorder.modelUsage()
 	total.Add(e.retry.discarded())
+	for _, m := range e.auxiliary {
+		total.Add(m.used())
+	}
 	return total
 }
 
@@ -696,10 +755,11 @@ func (e *execution) encodeState() ([]byte, error) {
 	used, active := e.completion.snapshot()
 	s := state{
 		Version: checkpointVersion, Messages: messages, Seen: slices.Sorted(maps.Keys(e.history.seen)),
-		MediaCount: e.history.mediaCount, MediaBytes: e.history.mediaBytes, MediaEnabled: e.media.enabled.Load(),
+		MediaEnabled: e.media.enabled.Load(), MediaPending: e.injector.pendingRefs(),
 		ClaimedSeq: e.inputs.boundary(), Turns: e.turns, Iterations: e.budget.count(), Corrections: used,
-		Completion: active, Usage: e.totalUsage(),
+		Completion: active, Usage: e.totalUsage(), KeepFromID: e.summarizers[0].keptFrom(), Offloaded: e.offloaded.snapshot(),
 	}
+	s.MediaCount, s.MediaBytes = e.media.budget.used()
 	for name, ext := range e.extensions.stateful {
 		data, err := ext.Save()
 		if err != nil {
@@ -786,6 +846,7 @@ func (e *execution) restore(ctx context.Context) (bool, error) {
 		messages = messages[:last]
 	}
 	// Results of the last output's calls come from the latest records.
+	restoredMedia := map[string][]MediaRef{}
 	if last := len(messages) - 1; last >= 0 && messages[last].Role == schema.AgenticRoleTypeAssistant {
 		records := map[string]*ToolCall{}
 		for _, b := range blocks {
@@ -800,6 +861,10 @@ func (e *execution) restore(ctx context.Context) (bool, error) {
 			}
 			if result, ok := modelResult(record); ok {
 				e.patched[c.CallID] = result
+				// Media of a result that never reached the model is passed again.
+				if len(record.Media) > 0 {
+					restoredMedia[c.CallID] = record.Media
+				}
 				e.observe(ctx, CallOutcome{Agent: e.main.scope, Name: c.Name, Call: record.Clone(), Raw: result, Origin: OriginRestored})
 			}
 		}
@@ -814,11 +879,19 @@ func (e *execution) restore(ctx context.Context) (bool, error) {
 	for _, key := range s.Seen {
 		e.history.seen[key] = true
 	}
-	e.history.mediaCount, e.history.mediaBytes = s.MediaCount, s.MediaBytes
+	e.media.budget.restore(s.MediaCount, s.MediaBytes)
+	e.injector.restore(s.MediaPending)
+	for id, refs := range restoredMedia {
+		e.injector.add(id, refs)
+	}
 	e.turns = s.Turns
 	e.media.enabled.Store(s.MediaEnabled)
 	e.budget.resume(s.Iterations)
 	e.completion.restore(s.Corrections, active)
+	e.summarizers[0].restoreKeepFrom(s.KeepFromID)
+	if err := e.offloaded.restore(ctx, s.Offloaded); err != nil {
+		return false, err
+	}
 	e.inputs.resumeFrom(s.ClaimedSeq)
 	if s.ClaimedSeq > 0 {
 		claim, err := e.inputs.replay(ctx)
