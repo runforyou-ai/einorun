@@ -16,16 +16,33 @@ type Config struct {
 	// of ADK's own prompts is a process-wide setting the host makes with
 	// adk.SetLanguage.
 	Language llm.Language
+	// Text overrides the default model-facing text of Language, field by
+	// field; empty fields keep the default.
+	Text Text
 }
 
 // Runtime executes runs. It is safe for concurrent use.
 type Runtime struct {
 	language llm.Language
+	text     Text
 }
 
 // New returns a runtime.
 func New(config Config) *Runtime {
-	return &Runtime{language: config.Language}
+	return &Runtime{language: config.Language, text: DefaultText(config.Language).withOverrides(config.Text)}
+}
+
+// Text returns the model-facing text the runtime writes.
+func (r *Runtime) Text() Text { return r.text }
+
+// InterruptedOutcome returns the status and model-visible result the runtime
+// gives a single call that started and did not finish, by its traits and
+// with the runtime's text. Hosts use it to settle such calls outside a run,
+// for example when an external executor is lost. Recovery also turns a call
+// whose sub-agent calls have pending or unrepeatable effects into needs
+// review; hosts leave such calls to the runtime.
+func (r *Runtime) InterruptedOutcome(replayable, sideEffects bool) (CallStatus, string) {
+	return interrupted(replayable, sideEffects, &r.text)
 }
 
 // Model describes the chat model of a run.
@@ -111,6 +128,22 @@ type Request struct {
 	// DiscardUndelivered drops direct text superseded by new input from the
 	// model history; the process record keeps it.
 	DiscardUndelivered bool
+	// BuiltinTools adjusts the tools the runtime and the built-in extensions
+	// add, such as the delegation tool, the task list tools, the skill tool
+	// and OffloadReadTool, by model-visible name (including a custom ToolName).
+	// Naming a tool the run does not add is an error; host tools carry these
+	// settings in their ToolSpec. The skill and offload read tools are also
+	// used by sub-agents; a policy tells agents apart by CallView.Agent.
+	BuiltinTools map[string]BuiltinTool
+}
+
+// BuiltinTool adjusts a tool the runtime or a built-in extension adds.
+type BuiltinTool struct {
+	// Notes are added to every call record of the tool; they win over the
+	// tool's own notes with the same key.
+	Notes map[string]string
+	// Policy, when set, decides per call, as ToolSpec.Policy does.
+	Policy func(ctx context.Context, call CallView) (CallPolicy, error)
 }
 
 // Result is the outcome of a run.

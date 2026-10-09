@@ -187,7 +187,11 @@ func (t *subagentType) Run(ctx context.Context, input *adk.TypedAgentInput[*sche
 // newSubagent builds a sub-agent serving the main-agent call with the
 // provider call ID parentCallID. The returned function releases its tools.
 func (e *execution) newSubagent(ctx context.Context, spec SubagentSpec, parentCallID string, input *adk.TypedAgentInput[*schema.AgenticMessage]) (adk.TypedAgent[*schema.AgenticMessage], func(), error) {
-	scope := AgentScope{Name: spec.Name}
+	parent, ok := e.recorder.mainCall(parentCallID)
+	if !ok {
+		return nil, nil, &abortError{err: errors.New("einorun: sub-agent without its delegation call")}
+	}
+	scope := AgentScope{Name: spec.Name, ID: parent.ID}
 	maxIterations := cmp.Or(spec.MaxIterations, e.budget.max)
 	a := &agent{
 		scope: scope, parentCallID: parentCallID,

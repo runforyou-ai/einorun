@@ -29,7 +29,15 @@ type AgentScope struct {
 	Name string
 	// Main is true for the main agent and false for sub-agents.
 	Main bool
+	// ID identifies the agent within the run: MainAgentID for the main agent,
+	// and for a sub-agent the record ID of the call it serves, which is the
+	// ParentID of its calls. Parallel sub-agents of the same type have
+	// different IDs.
+	ID string
 }
+
+// MainAgentID is the AgentScope.ID of the main agent.
+const MainAgentID = "main"
 
 // ToolSpec registers a tool for a run.
 type ToolSpec struct {

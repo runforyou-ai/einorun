@@ -19,7 +19,6 @@ import (
 	"github.com/cloudwego/eino/schema"
 
 	"github.com/runforyou-ai/einorun/internal/checkpoint"
-	"github.com/runforyou-ai/einorun/internal/prompt"
 	"github.com/runforyou-ai/einorun/llm"
 )
 
@@ -72,7 +71,7 @@ type extensionSet struct {
 // execution is one execution attempt of a run.
 type execution struct {
 	request    Request
-	text       *prompt.Runtime
+	text       *Text
 	language   llm.Language
 	recorder   *recorder
 	completion *completionState
@@ -121,7 +120,7 @@ func (f toolObserverFunc) AfterTool(ctx context.Context, outcome CallOutcome) { 
 // assemble prepares an execution: extensions, recorder, tools, completion
 // protocol, agent and the restored state.
 func (r *Runtime) assemble(ctx context.Context, request Request) (*execution, error) {
-	text := prompt.RuntimeFor(string(r.language))
+	text := &r.text
 	e := &execution{request: request, text: text, language: r.language, patched: map[string]string{}}
 	if request.Journal == nil {
 		e.memory = NewMemoryJournal()
@@ -140,7 +139,7 @@ func (r *Runtime) assemble(ctx context.Context, request Request) (*execution, er
 	e.window = llm.ContextWindow(request.Model.ContextWindow)
 	e.contextPolicy = request.Context.withDefaults()
 	e.offloaded = newOffloadStore(func(ctx context.Context) error { return e.save(ctx) })
-	e.main = &agent{scope: AgentScope{Name: "main", Main: true}}
+	e.main = &agent{scope: AgentScope{Name: MainAgentID, Main: true, ID: MainAgentID}}
 
 	tools, completionTools, err := e.registerTools(ctx, e.main.scope)
 	if err != nil {
@@ -182,6 +181,9 @@ func (r *Runtime) assemble(ctx context.Context, request Request) (*execution, er
 	e.capture = &inputCapture{}
 	e.main.budget, e.main.injector, e.main.offloaded, e.main.retry = e.budget, e.injector, e.offloaded, e.retry
 	if err := e.bindBuiltins(ctx); err != nil {
+		return e, err
+	}
+	if err := e.checkBuiltinTools(); err != nil {
 		return e, err
 	}
 
@@ -380,7 +382,35 @@ func (e *execution) declareTool(name string, spec ToolSpec, describe func(argume
 	if _, exists := e.recorder.tools[name]; exists {
 		return fmt.Errorf("einorun: tool %s is registered twice", name)
 	}
-	e.recorder.tools[name] = &toolEntry{spec: spec, name: name, describe: describe}
+	if adjust, ok := e.request.BuiltinTools[name]; ok {
+		spec.Notes = maps.Clone(spec.Notes)
+		if spec.Notes == nil && len(adjust.Notes) > 0 {
+			spec.Notes = map[string]string{}
+		}
+		maps.Copy(spec.Notes, adjust.Notes)
+		if adjust.Policy != nil {
+			spec.Policy = adjust.Policy
+		}
+	}
+	e.recorder.tools[name] = &toolEntry{spec: spec, name: name, describe: describe, builtin: true}
+	return nil
+}
+
+// checkBuiltinTools reports BuiltinTools entries that name no tool the run
+// added.
+func (e *execution) checkBuiltinTools() error {
+	for name := range e.request.BuiltinTools {
+		if entry, ok := e.recorder.tools[name]; !ok || !entry.builtin {
+			var builtins []string
+			for n, entry := range e.recorder.tools {
+				if entry.builtin {
+					builtins = append(builtins, n)
+				}
+			}
+			slices.Sort(builtins)
+			return fmt.Errorf("einorun: BuiltinTools names %s, which is not a built-in tool of the run (built-in tools: %s)", name, strings.Join(builtins, ", "))
+		}
+	}
 	return nil
 }
 
@@ -1085,7 +1115,7 @@ func (e *execution) finishRestored(ctx context.Context) error {
 // advances them; sub-agent calls never keep the run suspended. A call whose
 // sub-agent started calls with side effects that cannot be repeated, or has
 // calls with pending external effects, needs review.
-func settleInterrupted(blocks []Block, children []ToolCall, at time.Time, text *prompt.Runtime) (changed []ToolCall, waiting bool) {
+func settleInterrupted(blocks []Block, children []ToolCall, at time.Time, text *Text) (changed []ToolCall, waiting bool) {
 	risky := map[string]bool{}
 	for _, c := range children {
 		pending := c.Handover != HandoverNone && !c.Status.Settled()
@@ -1124,7 +1154,7 @@ func settleInterrupted(blocks []Block, children []ToolCall, at time.Time, text *
 
 // interrupted returns the status and model-visible result of an interrupted
 // call.
-func interrupted(replayable, sideEffects bool, text *prompt.Runtime) (CallStatus, string) {
+func interrupted(replayable, sideEffects bool, text *Text) (CallStatus, string) {
 	switch {
 	case sideEffects && !replayable:
 		return StatusNeedsReview, text.NeedsReview

@@ -30,7 +30,7 @@ func TestFeed(t *testing.T) {
 		f := inmem.NewFeed()
 		return journaltest.FeedHarness{
 			Feed:    f,
-			Append:  func(_ context.Context, m einorun.Message) (int64, error) { return f.Append(m), nil },
+			Append:  func(_ context.Context, m einorun.Message) (int64, einorun.Message, error) { return f.Append(m), m, nil },
 			Consume: func(_ context.Context, seq int64) error { f.Consume(seq); return nil },
 		}
 	})

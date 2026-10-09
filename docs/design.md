@@ -179,6 +179,15 @@ type Step struct {
   outcomes, host-first handovers, external results arriving before the
   handover write, stale or non-handover writes that must not fill a receipt,
   notes, steps and removals, block links and concurrent writes to one call.
+  Every ID and model call ID it writes is a fresh UUIDv7, and payloads are
+  compared as JSON values, so SQL journals with UUID and JSON columns run it
+  unchanged; provider call IDs are unique per test and not UUIDs, main calls
+  have an empty `ParentID` (stored as NULL, read back empty), and an empty
+  payload must read back empty. The Feed suite compares claims with the
+  message the host's harness reports it stored, so feeds that derive
+  messages from their own records (assigning IDs and revisions, keeping only
+  some fields) run it too; distinct messages must keep distinct ID and
+  revision pairs, since the runtime deduplicates history by them.
 
 ### Ownership
 
@@ -352,6 +361,15 @@ type ToolSpec struct {
 type CallPolicy struct { Submit *Submission; Replayable, SideEffects *bool; Notes map[string]string }
 type Submission struct { Receipt string; Payload json.RawMessage }
 ```
+
+`AgentScope{Name, Main, ID}` identifies the agent: `ID` is `MainAgentID` for
+the main agent and, for a sub-agent, the record ID of the call it serves (the
+`ParentID` of its calls), so parallel sub-agents of one type are told apart.
+
+Tools the runtime and the built-in extensions add (`OffloadReadTool`, the
+delegation tool, the task list tools, the skill tool) take notes and a
+policy through `Request.BuiltinTools`, by model-visible name; naming another
+tool is an error.
 
 `Tool` and `New` are mutually exclusive; `New` builds one instance per agent
 and its release function runs when that agent ends. At execution time tools
@@ -570,5 +588,11 @@ configurable.
   review, end of budget, batch violations, summary preamble, offload read-back,
   sub-agent description, structured retry, media that cannot be viewed, tool
   unavailable, memory defaults, web tools) exists in Chinese and English and
-  can be overridden. Receipts, completion tools and guard corrections are
-  written by the host.
+  can be overridden: the runtime's text is the public `Text`, which
+  `Config.Text` overrides field by field (`DefaultText` returns the defaults,
+  `Runtime.Text` the text in use); the text of `memory` and `tools/web` is
+  set through their options. `Runtime.InterruptedOutcome` gives the status
+  and text the runtime uses for a single interrupted call, for hosts that
+  settle calls outside a run; delegations whose sub-agent calls have pending
+  or unrepeatable effects are left to recovery. Receipts, completion tools and guard corrections
+  are written by the host.

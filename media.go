@@ -16,7 +16,6 @@ import (
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
 
-	"github.com/runforyou-ai/einorun/internal/prompt"
 	"github.com/runforyou-ai/einorun/llm"
 )
 
@@ -80,7 +79,7 @@ type mediaInjector struct {
 	adk.TypedBaseChatModelAgentMiddleware[*schema.AgenticMessage]
 	policy   mediaPolicy
 	inResult bool
-	text     *prompt.Runtime
+	text     *Text
 
 	mu       sync.Mutex
 	pending  map[string][]MediaRef             // provider call ID -> media not yet passed
