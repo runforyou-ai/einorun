@@ -79,7 +79,9 @@ func RejectCall(reason string) error { return &CallRejection{Reason: reason} }
 //     HandoverNone, see CallPolicy.Confirm): its first write is where the host
 //     creates the pending decision, and refusing it fails the call.
 //     The host decides a paused call by writing its Decision; the run then
-//     resumes and carries the decision out.
+//     resumes and carries the decision out. A decision is final once written:
+//     the host does not change it, and, as for any resume, runs one execution
+//     of a run at a time, so a decision is carried out once.
 //     A host that notifies reviewers of calls needing review does so when the
 //     merged record newly reaches StatusNeedsReview, not because the incoming
 //     snapshot says so.

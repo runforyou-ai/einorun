@@ -38,8 +38,9 @@ type Block struct {
 
 // CallStatus is the status of a tool call. The runtime only produces the
 // statuses below; hosts may persist further statuses for calls they own, such
-// as rejected or expired submissions, and the runtime treats any status it
-// does not know as settled.
+// as expired or cancelled submissions, and the runtime treats any status it
+// does not know as settled. Hosts may also record a submission they reject as
+// StatusRejected.
 type CallStatus string
 
 const (
@@ -119,12 +120,12 @@ type CallCompletion struct {
 // CallPolicy.Confirm). The host writes it; the runtime carries it out when
 // the run resumes.
 type CallDecision struct {
-	// Approved runs the call; otherwise it is rejected and the model sees
-	// Reason.
+	// Approved runs the call; otherwise, including for the zero value, it is
+	// rejected and the model sees Reason.
 	Approved bool   `json:"approved"`
 	Reason   string `json:"reason,omitempty"`
 	// Arguments, when set on an approval, replace the arguments the model
-	// gave.
+	// gave; the spec's Policy does not check them again.
 	Arguments string `json:"arguments,omitempty"`
 }
 

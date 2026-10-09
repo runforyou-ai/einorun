@@ -436,18 +436,27 @@ type ToolCall struct {
     Rev         uint64
     Result, Error *string
     Media       []MediaRef
-    Status      CallStatus // queued running waiting awaiting_decision succeeded failed interrupted needs_review
+    Status      CallStatus // queued running waiting awaiting_decision succeeded failed interrupted needs_review rejected
     StartedAt, CompletedAt *time.Time
     Replayable, SideEffects bool
     Handover    Handover
     Payload     json.RawMessage
     Completion  *CallCompletion
     Notes       map[string]string
+    Decision    *CallDecision // the host's decision on a paused call
 }
+type CallDecision struct { Approved bool; Reason, Arguments string }
 ```
 
-NUL characters are removed from results and errors. Lifecycles beyond the run
-(rejected, expired, cancelled, reviewed) belong to the host. Usage covers the
+NUL characters are removed from results and errors. `rejected` is the
+runtime's status for a paused call the host rejected; hosts may use the same
+value for submissions they reject. Other lifecycles beyond the run (expired,
+cancelled, reviewed) belong to the host.
+
+A decision approves only with `Approved` set; its zero value rejects. Empty
+`Arguments` keep the model's arguments. An approved call is not checked by
+the spec's `Policy` again: the decision is the check. Calls of one batch are
+carried out one after another, in the order the model gave them. Usage covers the
 main model, summaries, memory selection, sub-agents and discarded output.
 
 ## Extensions

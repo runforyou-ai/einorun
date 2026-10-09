@@ -1010,7 +1010,7 @@ func (e *execution) restore(ctx context.Context) (bool, error) {
 			if !ok {
 				continue
 			}
-			if result, ok := modelResult(record); ok {
+			if result, ok := modelResult(record, e.text); ok {
 				e.patched[c.CallID] = result
 				// Media of a result that never reached the model is passed again.
 				if len(record.Media) > 0 {
@@ -1060,8 +1060,15 @@ func (e *execution) restore(ctx context.Context) (bool, error) {
 				records[b.Call.CallID] = b.Call
 			}
 		}
-		if err := e.carryOutDecisions(ctx, messages[last], records); err != nil {
+		carried, err := e.carryOutDecisions(ctx, messages[last], records)
+		if err != nil {
 			return false, err
+		}
+		// What carrying out the decisions changed is saved like a batch.
+		if carried {
+			if err := e.save(ctx); err != nil {
+				return false, err
+			}
 		}
 	}
 	// An approved call may hand itself over to an external executor.
@@ -1194,8 +1201,18 @@ func interrupted(replayable, sideEffects bool, text *Text) (CallStatus, string) 
 }
 
 // modelResult returns what the model sees for a call record: a receipt, the
-// error or the result.
-func modelResult(call *ToolCall) (string, bool) {
+// error or the result, preceded by the changed arguments of a call approved
+// with them.
+func modelResult(call *ToolCall, text *Text) (string, bool) {
+	result, ok := recordResult(call)
+	if ok && call.Decision != nil && call.Decision.Approved && call.Decision.Arguments != "" {
+		result = fmt.Sprintf(text.CallEdited, call.Decision.Arguments) + result
+	}
+	return result, ok
+}
+
+// recordResult returns the receipt, the error or the result of a call record.
+func recordResult(call *ToolCall) (string, bool) {
 	switch {
 	case call.Handover == HandoverDetached || call.Handover == HandoverSubmitted:
 		if call.Result != nil {

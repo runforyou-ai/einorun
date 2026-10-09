@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"maps"
 	"strings"
@@ -195,7 +194,11 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 		return x.pause(ctx, a, input, entry, policy)
 	}
 	now := time.Now()
-	record, err := x.update(ctx, a, input, func(call *ToolCall) {
+	write := x.update
+	if policy.Submit != nil {
+		write = x.handOver
+	}
+	record, err := write(ctx, a, input, func(call *ToolCall) {
 		// A decided call keeps the arguments the model gave; the decision
 		// records the ones it ran with.
 		if decision == nil {
@@ -267,11 +270,6 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 	if execErr == nil {
 		refs = media.attached()
 	}
-	// A call that ran with changed arguments tells the model so.
-	edited := execErr == nil && decision != nil && decision.Arguments != ""
-	if edited {
-		result = fmt.Sprintf(x.text.CallEdited, decision.Arguments) + result
-	}
 	call, err := x.finishWith(ctx, a, input, result, execErr, refs)
 	if err != nil {
 		return nil, err
@@ -283,9 +281,6 @@ func (x *execution) runCall(ctx context.Context, a *agent, input *compose.ToolIn
 		return text(errorResult(execErr))
 	}
 	x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: call, Raw: raw, Origin: OriginExecuted})
-	if edited {
-		return text(result)
-	}
 	return nil, nil
 }
 
@@ -330,10 +325,10 @@ func (x *execution) pause(ctx context.Context, a *agent, input *compose.ToolInpu
 	switch {
 	case policy.Submit != nil:
 		return fail(errors.New("einorun: a policy may not both submit and confirm a call"))
-	case !a.scope.Main || (entry != nil && entry.spec.Completion):
+	case !a.scope.Main || (entry != nil && entry.spec.Completion) || !confirmable(a.tools[input.Name]):
 		return fail(errors.New(x.text.CannotConfirm))
 	}
-	_, err := x.update(ctx, a, input, func(call *ToolCall) {
+	call, err := x.handOver(ctx, a, input, func(call *ToolCall) {
 		call.Arguments = input.Arguments
 		applyPolicy(call, policy)
 		call.Status, call.Payload = StatusAwaitingDecision, policy.Confirm.Payload
@@ -344,6 +339,7 @@ func (x *execution) pause(ctx context.Context, a *agent, input *compose.ToolInpu
 	if err != nil {
 		return nil, err
 	}
+	x.observe(ctx, CallOutcome{Agent: a.scope, Name: input.Name, Call: call, Origin: OriginExecuted})
 	// The run suspends after the batch; the model never sees this result.
 	result := x.text.AwaitingResult
 	return &result, nil
@@ -434,6 +430,15 @@ func (x *execution) finishWith(ctx context.Context, a *agent, input *compose.Too
 		result = strings.ReplaceAll(result, "\x00", "")
 		call.Status, call.Result = StatusSucceeded, &result
 	})
+}
+
+// handOver writes a call the host takes a decision on. No step is saved
+// meanwhile, so the host sees the call first through SaveToolCall, where it
+// creates the pending decision or refuses it.
+func (x *execution) handOver(ctx context.Context, a *agent, input *compose.ToolInput, change func(*ToolCall)) (ToolCall, error) {
+	x.saveMu.Lock()
+	defer x.saveMu.Unlock()
+	return x.update(ctx, a, input, change)
 }
 
 // update changes the record of a call of agent a and writes it. A

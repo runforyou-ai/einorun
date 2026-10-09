@@ -35,8 +35,9 @@ type Text struct {
 	// AwaitingResult is the placeholder result of a call waiting for an
 	// external result.
 	AwaitingResult string
-	// CannotConfirm fails a call a policy paused for a decision where the run
-	// cannot suspend, or that cannot be carried out after one.
+	// CannotConfirm fails a call a policy pauses for a decision where it
+	// cannot pause: in a sub-agent, for a completion tool, or for a tool the
+	// runtime cannot carry out after the decision.
 	CannotConfirm string
 	// CallRejected is the result of a paused call the host rejected. %s is
 	// the reason.
@@ -98,7 +99,7 @@ var texts = map[llm.Language]Text{
 		CannotDetach:          "这个调用无法交给外部继续执行，没有执行。",
 		CannotComplete:        "这个工具不能结束本次运行。",
 		AwaitingResult:        `{"status":"awaiting_external_result"}`,
-		CannotConfirm:         "这个调用需要确认后才能执行，当前无法等待确认，没有执行。",
+		CannotConfirm:         "这个调用需要确认后才能执行，但在这里不能暂停等待确认，没有执行。",
 		CallRejected:          "这个调用没有获得批准，没有执行。原因：%s",
 		CallEdited:            "这个调用经确认后按修改过的参数执行：%s\n结果：\n",
 		BatchTooMany:          "%s 一次只能调用其中一个。",
@@ -127,7 +128,7 @@ var texts = map[llm.Language]Text{
 		CannotDetach:          "This call cannot be handed over and was not executed.",
 		CannotComplete:        "This tool cannot end the run.",
 		AwaitingResult:        `{"status":"awaiting_external_result"}`,
-		CannotConfirm:         "This call needs a confirmation before it runs, which cannot be awaited here; it was not executed.",
+		CannotConfirm:         "This call needs a confirmation before it runs but cannot pause for one here; it was not executed.",
 		CallRejected:          "This call was not approved and did not run. Reason: %s",
 		CallEdited:            "This call ran after confirmation with changed arguments: %s\nResult:\n",
 		BatchTooMany:          "Call only one of %s at a time.",

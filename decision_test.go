@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
+	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 
 	"github.com/runforyou-ai/einorun"
@@ -264,5 +266,157 @@ func TestApprovedLargeResultIsOffloaded(t *testing.T) {
 	result := resume(t, request, journal)
 	if !strings.Contains(result.Text, einorun.OffloadedPath("")) || len(result.Text) >= 50000 {
 		t.Fatalf("result not offloaded: %d bytes", len(result.Text))
+	}
+}
+
+// outcomes is a stateful extension counting the call outcomes it sees.
+type outcomes struct {
+	mu    sync.Mutex
+	count int
+}
+
+func (o *outcomes) Name() string { return "outcomes" }
+func (o *outcomes) AfterTool(context.Context, einorun.CallOutcome) {
+	o.mu.Lock()
+	o.count++
+	o.mu.Unlock()
+}
+func (o *outcomes) Save() (json.RawMessage, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return json.Marshal(o.count)
+}
+func (o *outcomes) Restore(data json.RawMessage) error { return json.Unmarshal(data, &o.count) }
+
+func TestApprovedCallThatAwaitsSuspendsWithItsState(t *testing.T) {
+	m := &scripted{steps: []step{call(invocation{"pay", `{"x":"1"}`}), func(input []*schema.AgenticMessage) *schema.AgenticMessage {
+		return say(lastUser(input))(input)
+	}}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "pay")
+	journal := inmem.NewJournal()
+	pay := &fn{name: "pay", run: func(context.Context, string) (string, error) { return "", einorun.Await(nil) }}
+	request := einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed, Journal: journal,
+		Tools: []einorun.ToolSpec{{Tool: pay, Policy: confirmed}}, Extensions: []einorun.Extension{&outcomes{}}}
+	if _, err := run(t, request); err != nil {
+		t.Fatal(err)
+	}
+	decide(t, journal, "pay", einorun.CallDecision{Approved: true, Arguments: `{"x":"2"}`})
+	request.Extensions = []einorun.Extension{&outcomes{}}
+	if again := resume(t, request, journal); !again.Suspended {
+		t.Fatalf("approved call that awaits did not suspend: %+v", again)
+	}
+	// The outcome the extension saw while carrying out the decision is saved.
+	restored := &outcomes{}
+	request.Extensions = []einorun.Extension{restored}
+	waiting := journal.Resume().Blocks[0].Call
+	result := "paid 2"
+	if err := journal.External(context.Background(), einorun.ToolCall{ID: waiting.ID, Status: einorun.StatusSucceeded, Result: &result}); err != nil {
+		t.Fatal(err)
+	}
+	done := resume(t, request, journal)
+	if restored.count < 1 {
+		t.Fatalf("extension state lost: %d", restored.count)
+	}
+	// The model learns the changed arguments with the external result.
+	if !strings.Contains(done.Text, `{"x":"2"}`) || !strings.HasSuffix(done.Text, "paid 2") {
+		t.Fatalf("text %q", done.Text)
+	}
+}
+
+func TestChangedArgumentsPrecedeAnError(t *testing.T) {
+	m := &scripted{steps: []step{call(invocation{"pay", `{"x":"1"}`}), func(input []*schema.AgenticMessage) *schema.AgenticMessage {
+		return say(lastUser(input))(input)
+	}}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "pay")
+	journal := inmem.NewJournal()
+	pay := &fn{name: "pay", run: func(context.Context, string) (string, error) { return "", errors.New("card declined") }}
+	request := einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed, Journal: journal,
+		Tools: []einorun.ToolSpec{{Tool: pay, Policy: confirmed}}}
+	if _, err := run(t, request); err != nil {
+		t.Fatal(err)
+	}
+	decide(t, journal, "pay", einorun.CallDecision{Approved: true, Arguments: `{"x":"2"}`})
+	result := resume(t, request, journal)
+	if !strings.Contains(result.Text, `{"x":"2"}`) || !strings.Contains(result.Text, "card declined") {
+		t.Fatalf("text %q", result.Text)
+	}
+}
+
+func TestApprovedCallPanicEndsTheRun(t *testing.T) {
+	m := &scripted{steps: []step{call(invocation{"pay", `{}`})}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "pay")
+	journal := inmem.NewJournal()
+	pay := &fn{name: "pay", run: func(context.Context, string) (string, error) { panic("boom") }}
+	request := einorun.Request{RunID: "r1", Model: einorun.Model{New: m.factory}, Feed: feed, Journal: journal,
+		Tools: []einorun.ToolSpec{{Tool: pay, SideEffects: true, Policy: confirmed}}}
+	if _, err := run(t, request); err != nil {
+		t.Fatal(err)
+	}
+	decide(t, journal, "pay", einorun.CallDecision{Approved: true})
+	saved := journal.Resume()
+	request.Resume = &saved
+	if _, err := run(t, request); err == nil || !strings.Contains(err.Error(), "panicked") {
+		t.Fatalf("err %v", err)
+	}
+	// The call was running; its side effects are unknown.
+	m.steps = []step{say("checked")}
+	result := resume(t, request, journal)
+	if result.Blocks[0].Call.Status != einorun.StatusNeedsReview {
+		t.Fatalf("call %+v", result.Blocks[0].Call)
+	}
+}
+
+// pictures is a tool with structured results.
+type pictures struct{ fn }
+
+func (p *pictures) InvokableRun(ctx context.Context, argument *schema.ToolArgument, _ ...tool.Option) (*schema.ToolResult, error) {
+	return &schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "picture"}}}, nil
+}
+
+func TestStructuredResultToolsCannotPause(t *testing.T) {
+	m := &scripted{steps: []step{call(invocation{"draw", `{}`}), func(input []*schema.AgenticMessage) *schema.AgenticMessage {
+		return say(lastUser(input))(input)
+	}}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "draw")
+	result, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed,
+		Tools: []einorun.ToolSpec{{Tool: &pictures{fn{name: "draw"}}, Policy: confirmed}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Suspended || result.Blocks[0].Call.Status != einorun.StatusFailed {
+		t.Fatalf("result %+v call %+v", result, result.Blocks[0].Call)
+	}
+}
+
+func TestBuiltinToolsCannotPause(t *testing.T) {
+	m := &scripted{steps: []step{call(invocation{"agent", `{"subagent_type":"general","prompt":"p","description":"d"}`}), func(input []*schema.AgenticMessage) *schema.AgenticMessage {
+		return say(lastUser(input))(input)
+	}}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "go")
+	result, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed,
+		Extensions:   []einorun.Extension{einorun.Subagent(einorun.SubagentSpec{})},
+		BuiltinTools: map[string]einorun.BuiltinTool{"agent": {Policy: confirmed}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Suspended || result.Blocks[0].Call.Status != einorun.StatusFailed || !strings.Contains(result.Text, "cannot pause") {
+		t.Fatalf("result %+v call %+v", result, result.Blocks[0].Call)
+	}
+}
+
+func TestPauseIsObserved(t *testing.T) {
+	m := &scripted{steps: []step{call(invocation{"pay", `{}`})}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "pay")
+	seen := &outcomes{}
+	result, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory}, Feed: feed,
+		Tools: []einorun.ToolSpec{{Tool: echo("pay"), Policy: confirmed}}, Extensions: []einorun.Extension{seen}})
+	if err != nil || !result.Suspended || seen.count != 1 {
+		t.Fatalf("result %+v err %v outcomes %d", result, err, seen.count)
 	}
 }

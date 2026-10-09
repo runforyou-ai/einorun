@@ -34,8 +34,8 @@ type JournalHarness struct {
 	Load func(ctx context.Context) (einorun.Resume, error)
 	// External applies a write the host makes outside the runtime, with
 	// einorun.OverlayExternal semantics: Status, Result, Error, Media,
-	// CompletedAt, Handover and Payload when set. The suite only uses it on
-	// calls that exist.
+	// CompletedAt, Handover, Payload and Decision when set. The suite only
+	// uses it on calls that exist.
 	External func(ctx context.Context, update einorun.ToolCall) error
 	// Call returns the stored record of a call, main or sub-agent, and false
 	// when there is none.
