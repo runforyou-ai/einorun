@@ -156,7 +156,8 @@ type Step struct {
   written by the host outside the runtime are authoritative
   (`OverlayExternal` describes such writes).
 - If the host already recorded a handover (for example when its dispatch
-  transaction committed before the tool returned), a newer runtime snapshot
+  transaction committed before the tool returned), whether or not the call is
+  settled by then, a newer runtime snapshot
   that hands the call over too only fills in the payload if there is none and
   the receipt while the call has neither a result nor an error; it never moves
   the host's `queued`/`running` or final status.

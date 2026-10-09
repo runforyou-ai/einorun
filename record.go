@@ -3,6 +3,7 @@ package einorun
 import (
 	"encoding/json"
 	"maps"
+	"slices"
 	"time"
 
 	"github.com/runforyou-ai/einorun/llm"
@@ -164,11 +165,11 @@ func (c ToolCall) Clone() ToolCall {
 	if c.CompletedAt != nil {
 		c.CompletedAt = new(*c.CompletedAt)
 	}
-	c.Media = append([]MediaRef(nil), c.Media...)
-	c.Payload = append(json.RawMessage(nil), c.Payload...)
+	c.Media = slices.Clone(c.Media)
+	c.Payload = slices.Clone(c.Payload)
 	if c.Completion != nil {
 		completion := *c.Completion
-		completion.Value = append(json.RawMessage(nil), completion.Value...)
+		completion.Value = slices.Clone(completion.Value)
 		c.Completion = &completion
 	}
 	c.Notes = maps.Clone(c.Notes)

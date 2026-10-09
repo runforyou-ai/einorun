@@ -107,10 +107,10 @@ func (c ToolCall) Validate() error {
 //   - It replaces the outcome (status, result, error, media, times, completion,
 //     handover, payload) only while the stored call is neither settled nor
 //     handed over. Settled outcomes are final, whatever the newer status.
-//   - When the host recorded a handover first, a newer snapshot that hands the
-//     call over too fills in the payload if there is none and the receipt
-//     while the call has neither a result nor an error. Status and times stay
-//     the host's.
+//   - When the host recorded a handover first, settled or not, a newer
+//     snapshot that hands the call over too fills in the payload if there is
+//     none and the receipt while the call has neither a result nor an error.
+//     Status and times stay the host's.
 func MergeCall(stored *ToolCall, incoming ToolCall) ToolCall {
 	if stored == nil {
 		return incoming.Clone()
@@ -126,8 +126,9 @@ func MergeCall(stored *ToolCall, incoming ToolCall) ToolCall {
 	merged.Replayable, merged.SideEffects = in.Replayable, in.SideEffects
 	merged.Notes = in.Notes
 	switch {
-	case stored.Status.Settled():
 	case stored.Handover != HandoverNone:
+		// The host handed the call over first, possibly settling it already;
+		// a handover snapshot only fills in what is still missing.
 		if in.Handover != HandoverNone {
 			if len(merged.Payload) == 0 {
 				merged.Payload = in.Payload
@@ -136,6 +137,7 @@ func MergeCall(stored *ToolCall, incoming ToolCall) ToolCall {
 				merged.Result = in.Result
 			}
 		}
+	case stored.Status.Settled():
 	default:
 		merged.Status, merged.Result, merged.Error, merged.Media = in.Status, in.Result, in.Error, in.Media
 		merged.StartedAt, merged.CompletedAt, merged.Completion = in.StartedAt, in.CompletedAt, in.Completion
@@ -146,8 +148,9 @@ func MergeCall(stored *ToolCall, incoming ToolCall) ToolCall {
 
 // OverlayExternal returns stored with a write the host makes outside the
 // runtime applied: Status, Result, Error, Media, CompletedAt, Handover and
-// Payload come from update when set; Rev and every other field are kept. It
-// describes the authoritative writes the Journal contract refers to.
+// Payload come from update when set (a non-nil empty Media clears the media);
+// Rev and every other field are kept. It describes the authoritative writes
+// the Journal contract refers to.
 func OverlayExternal(stored ToolCall, update ToolCall) ToolCall {
 	merged := stored.Clone()
 	u := update.Clone()

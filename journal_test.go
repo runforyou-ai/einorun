@@ -30,6 +30,14 @@ func TestSettled(t *testing.T) {
 	}
 }
 
+func TestOverlayExternalClearsMedia(t *testing.T) {
+	stored := ToolCall{ID: "a", Status: StatusRunning, Media: []MediaRef{{Key: "old"}}, Name: "n", Notes: map[string]string{"k": "v"}}
+	got := OverlayExternal(stored, ToolCall{ID: "a", Status: StatusSucceeded, Media: []MediaRef{}})
+	if len(got.Media) != 0 || got.Name != "n" || got.Notes["k"] != "v" || got.Status != StatusSucceeded {
+		t.Fatalf("overlay %+v", got)
+	}
+}
+
 func TestMergeCallFirstWrite(t *testing.T) {
 	result := "r"
 	in := ToolCall{ID: "a", Rev: 1, Status: StatusSucceeded, Result: &result, Notes: map[string]string{"k": "v"}}

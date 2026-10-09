@@ -27,6 +27,9 @@ type JournalHarness struct {
 	// CompletedAt, Handover and Payload when set. The suite only uses it on
 	// calls that exist.
 	External func(ctx context.Context, update einorun.ToolCall) error
+	// Call returns the stored record of a call, main or sub-agent, and false
+	// when there is none.
+	Call func(ctx context.Context, id string) (einorun.ToolCall, bool, error)
 	// Usage, when set, returns the usage of the last saved step.
 	Usage func(ctx context.Context) (einorun.Usage, error)
 }
@@ -103,23 +106,24 @@ func load(t *testing.T, h JournalHarness) einorun.Resume {
 	return resume
 }
 
-// find returns the record of the call "a", which every journal test uses.
+// find returns the record of the call "a", which most journal tests use.
 func find(t *testing.T, h JournalHarness) einorun.ToolCall {
-	const id = "a"
 	t.Helper()
-	resume := load(t, h)
-	for _, block := range resume.Blocks {
-		if block.Call != nil && block.Call.ID == id {
-			return *block.Call
-		}
+	call, ok := lookup(t, h, "a")
+	if !ok {
+		t.Fatal("call a not found")
 	}
-	for _, c := range resume.Calls {
-		if c.ID == id {
-			return c
-		}
+	return call
+}
+
+// lookup returns the stored record of id.
+func lookup(t *testing.T, h JournalHarness, id string) (einorun.ToolCall, bool) {
+	t.Helper()
+	call, ok, err := h.Call(context.Background(), id)
+	if err != nil {
+		t.Fatalf("call %s: %v", id, err)
 	}
-	t.Fatalf("call %s not found", id)
-	return einorun.ToolCall{}
+	return call, ok
 }
 
 func save(t *testing.T, h JournalHarness, c einorun.ToolCall) {
@@ -217,6 +221,9 @@ func testRuntimeHandover(t *testing.T, h JournalHarness) {
 func testHostHandoverFirst(t *testing.T, h JournalHarness) {
 	save(t, h, child("a", 1, einorun.StatusRunning))
 	external(t, h, einorun.ToolCall{ID: "a", Status: einorun.StatusQueued, Handover: einorun.HandoverDetached})
+	if got := find(t, h); got.Name != "tool" || got.Arguments != "{}" {
+		t.Fatalf("external write lost fields: %+v", got)
+	}
 	detached := child("a", 2, einorun.StatusRunning)
 	detached.Handover, detached.Result, detached.Payload = einorun.HandoverDetached, text("receipt"), json.RawMessage(`{"op":1}`)
 	save(t, h, detached)
@@ -245,6 +252,9 @@ func testExternalResultFirst(t *testing.T, h JournalHarness) {
 	got := find(t, h)
 	if got.Status != einorun.StatusSucceeded || str(got.Result) != "external" {
 		t.Fatalf("external result overwritten: %+v", got)
+	}
+	if string(got.Payload) != `{"op":1}` {
+		t.Fatalf("payload not filled in after an external result: %s", got.Payload)
 	}
 }
 
@@ -342,10 +352,11 @@ func testSteps(t *testing.T, h JournalHarness) {
 	if len(resume.Blocks) != 1 || resume.Blocks[0].ID != "b1" {
 		t.Fatalf("blocks after removal %+v", resume.Blocks)
 	}
-	for _, c := range resume.Calls {
-		if c.ID == "a" {
-			t.Fatal("removed call is still there")
-		}
+	if _, ok := lookup(t, h, "a"); ok {
+		t.Fatal("removed call is still there")
+	}
+	if _, ok := lookup(t, h, "s"); !ok {
+		t.Fatal("a call that was not removed is gone")
 	}
 }
 
@@ -379,7 +390,7 @@ func testConcurrentOneCall(t *testing.T, h JournalHarness) {
 	save(t, h, child("a", 1, einorun.StatusQueued))
 	var wg sync.WaitGroup
 	for rev := uint64(2); rev <= 21; rev++ {
-		wg.Add(2)
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			c := child("a", rev, einorun.StatusRunning)
@@ -388,14 +399,18 @@ func testConcurrentOneCall(t *testing.T, h JournalHarness) {
 				t.Error(err)
 			}
 		}()
-		go func() {
-			defer wg.Done()
-			stale := child("a", rev-1, einorun.StatusQueued)
+	}
+	// Steps are saved one at a time, concurrently with the calls.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for rev := uint64(1); rev <= 20; rev++ {
+			stale := child("a", rev, einorun.StatusQueued)
 			if err := h.Journal.SaveStep(ctx, einorun.Step{Changes: einorun.Changes{Calls: []einorun.ToolCall{stale}}}); err != nil {
 				t.Error(err)
 			}
-		}()
-	}
+		}
+	}()
 	wg.Wait()
 	got := find(t, h)
 	if got.Rev != 21 || got.Arguments != `{"rev":21}` || got.Status != einorun.StatusRunning {

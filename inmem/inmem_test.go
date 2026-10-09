@@ -13,9 +13,13 @@ func TestJournal(t *testing.T) {
 	journaltest.RunJournal(t, func(*testing.T) journaltest.JournalHarness {
 		j := inmem.NewJournal()
 		return journaltest.JournalHarness{
-			Journal:  j,
-			Load:     func(context.Context) (einorun.Resume, error) { return j.Resume(), nil },
-			Usage:    func(context.Context) (einorun.Usage, error) { return j.Usage(), nil },
+			Journal: j,
+			Load:    func(context.Context) (einorun.Resume, error) { return j.Resume(), nil },
+			Usage:   func(context.Context) (einorun.Usage, error) { return j.Usage(), nil },
+			Call: func(_ context.Context, id string) (einorun.ToolCall, bool, error) {
+				call, ok := j.Call(id)
+				return call, ok, nil
+			},
 			External: j.External,
 		}
 	})
