@@ -9,9 +9,9 @@ import (
 // Text is the model-facing text the runtime writes. Config.Text overrides
 // the default text of the run's language field by field: empty fields keep
 // the default. Format verbs are documented per field and must be kept; a
-// missing or wrong verb shows in the text the model sees. Text of other
-// packages (structured output retries, memory, web tools) is set through
-// their own options.
+// missing or wrong verb shows in the text the model sees. The memory and web
+// tool packages take their text through their own options; structured output
+// retries follow the language of the request.
 type Text struct {
 	// Cancelled is the result of a call that never got one because other
 	// input arrived first. %[1]s is the tool name, %[2]s the call identifier.

@@ -11,8 +11,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"math/big"
 	"reflect"
 	"sync"
 	"testing"
@@ -136,7 +139,13 @@ func sameJSON(a, b []byte) bool {
 		decoder := json.NewDecoder(bytes.NewReader(data))
 		decoder.UseNumber()
 		var v any
-		return v, decoder.Decode(&v)
+		if err := decoder.Decode(&v); err != nil {
+			return nil, err
+		}
+		if _, err := decoder.Token(); err != io.EOF {
+			return nil, errors.New("trailing data")
+		}
+		return exactNumbers(v), nil
 	}
 	x, errX := decode(a)
 	y, errY := decode(b)
@@ -144,6 +153,30 @@ func sameJSON(a, b []byte) bool {
 		return string(a) == string(b)
 	}
 	return reflect.DeepEqual(x, y)
+}
+
+// exactNumber is a JSON number in exact form, distinct from strings.
+type exactNumber string
+
+// exactNumbers replaces the numbers in v with exact rationals, so that 1 and
+// 1.0 are equal and large integers keep their precision.
+func exactNumbers(v any) any {
+	switch v := v.(type) {
+	case json.Number:
+		if r, ok := new(big.Rat).SetString(string(v)); ok {
+			return exactNumber(r.RatString())
+		}
+		return exactNumber(v)
+	case map[string]any:
+		for k, item := range v {
+			v[k] = exactNumbers(item)
+		}
+	case []any:
+		for i, item := range v {
+			v[i] = exactNumbers(item)
+		}
+	}
+	return v
 }
 
 func text(s string) *string { return &s }
