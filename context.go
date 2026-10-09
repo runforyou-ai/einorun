@@ -151,16 +151,34 @@ type offloadStore struct {
 	*filesystem.InMemoryBackend
 	mu    sync.Mutex
 	files map[string]string
+	// saved persists the checkpoint after a write, before the call whose
+	// result was offloaded is saved with its preview.
+	saved func(ctx context.Context) error
 }
 
 // Write stores a file and remembers it, atomically for snapshots.
 func (s *offloadStore) Write(ctx context.Context, req *filesystem.WriteRequest) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := s.InMemoryBackend.Write(ctx, req); err != nil {
+		s.mu.Unlock()
 		return err
 	}
 	s.files[req.FilePath] = req.Content
+	s.mu.Unlock()
+	if s.saved != nil && strings.HasPrefix(req.FilePath, offloadDir) {
+		return s.saved(ctx)
+	}
+	return nil
+}
+
+// restoreFile writes a saved file back without saving the checkpoint.
+func (s *offloadStore) restoreFile(ctx context.Context, path, content string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.InMemoryBackend.Write(ctx, &filesystem.WriteRequest{FilePath: path, Content: content}); err != nil {
+		return err
+	}
+	s.files[path] = content
 	return nil
 }
 
@@ -174,7 +192,7 @@ func (s *offloadStore) snapshot() map[string]string {
 // restore writes saved files back.
 func (s *offloadStore) restore(ctx context.Context, files map[string]string) error {
 	for path, content := range files {
-		if err := s.Write(ctx, &filesystem.WriteRequest{FilePath: path, Content: content}); err != nil {
+		if err := s.restoreFile(ctx, path, content); err != nil {
 			return fmt.Errorf("einorun: restore offloaded result %s: %w", path, err)
 		}
 	}
@@ -342,26 +360,30 @@ func (s *summarizer) BeforeModelRewriteState(ctx context.Context, state *adk.Typ
 	var event *compaction
 	var summarize, kept []*schema.AgenticMessage
 	keepAll := latest > start && round <= latest
-	if latest > start && round > latest {
-		// Keep everything from the newest input when it fits with a summary.
-		tail, err := s.counter(ctx, append(slices.Clone(system), state.Messages[latest:]...), state.ToolInfos)
-		if err != nil {
-			return ctx, nil, err
-		}
-		keepAll = tail+int64(s.output) <= s.trigger
-	}
-	if keepAll {
+	var keptPinned, pinnedRest []*schema.AgenticMessage
+	if latest > start {
 		pinned := s.pin(state.Messages[:latest])
-		var keptPinned []*schema.AgenticMessage
 		for i := start; i < latest; i++ {
 			message, rest := splitPinned(state.Messages[i], pinned)
 			if message != nil {
 				keptPinned = append(keptPinned, message)
 			}
 			if rest != nil {
-				summarize = append(summarize, rest)
+				pinnedRest = append(pinnedRest, rest)
 			}
 		}
+	}
+	if latest > start && round > latest {
+		// Keep everything from the newest input, with the pinned calls, when
+		// it fits with a summary.
+		tail, err := s.counter(ctx, slices.Concat(system, keptPinned, state.Messages[latest:]), state.ToolInfos)
+		if err != nil {
+			return ctx, nil, err
+		}
+		keepAll = tail+int64(s.output) <= s.trigger
+	}
+	if keepAll {
+		summarize = pinnedRest
 		kept = append(slices.Clone(keptPinned), state.Messages[latest:]...)
 		event = &compaction{keepFromID: keepFromID, kept: keptPinned}
 	} else {

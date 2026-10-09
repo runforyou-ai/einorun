@@ -273,3 +273,34 @@ func TestMediaSurvivesACrashBeforeTheStep(t *testing.T) {
 		t.Fatalf("images after recovery %d", images)
 	}
 }
+
+func TestMediaFollowsTheWholeBatch(t *testing.T) {
+	read := func(context.Context, einorun.MediaRef) ([]byte, error) { return []byte("img"), nil }
+	var order []string
+	m := &scripted{steps: []step{
+		call(invocation{"shot", "{}"}, invocation{"lookup", "{}"}),
+		func(input []*schema.AgenticMessage) *schema.AgenticMessage {
+			for _, msg := range input {
+				switch {
+				case len(msg.ContentBlocks) > 0 && msg.ContentBlocks[0].FunctionToolResult != nil:
+					order = append(order, "result")
+				case len(msg.ContentBlocks) > 0 && msg.ContentBlocks[0].UserInputImage != nil:
+					order = append(order, "media")
+				}
+			}
+			return say("ok")(input)
+		},
+	}}
+	feed := inmem.NewFeed()
+	user(feed, "m1", "look")
+	shot := &fn{name: "shot", run: func(ctx context.Context, _ string) (string, error) {
+		return "captured", einorun.AttachMedia(ctx, einorun.MediaRef{Key: "k", MIME: "image/png"})
+	}}
+	if _, err := run(t, einorun.Request{Model: einorun.Model{New: m.factory, Inputs: []llm.Modality{llm.Image}}, Feed: feed, ReadMedia: read,
+		Tools: []einorun.ToolSpec{{Tool: shot}, {Tool: echo("lookup")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(order, ",") != "result,result,media" {
+		t.Fatalf("order %v", order)
+	}
+}

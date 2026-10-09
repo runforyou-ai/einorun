@@ -158,9 +158,20 @@ func (m *mediaInjector) BeforeModelRewriteState(ctx context.Context, state *adk.
 	messages := make([]*schema.AgenticMessage, 0, len(state.Messages)+len(order))
 	injected := map[string]*schema.AgenticMessage{}
 	results := map[string]*schema.AgenticMessage{}
+	// Carriers follow the whole run of tool results of a batch, so that the
+	// results stay together.
+	var carriers []*schema.AgenticMessage
+	flush := func() {
+		messages = append(messages, carriers...)
+		carriers = nil
+	}
 	for _, message := range state.Messages {
+		ids := resultCallIDs(message)
+		if len(ids) == 0 {
+			flush()
+		}
 		var ready []string
-		for _, id := range resultCallIDs(message) {
+		for _, id := range ids {
 			if _, ok := items[id]; ok {
 				ready = append(ready, id)
 			}
@@ -188,9 +199,10 @@ func (m *mediaInjector) BeforeModelRewriteState(ctx context.Context, state *adk.
 				}
 			}
 			injected[id] = carrier
-			messages = append(messages, carrier)
+			carriers = append(carriers, carrier)
 		}
 	}
+	flush()
 	m.mu.Lock()
 	maps.Copy(m.injected, injected)
 	if len(results) > 0 {
@@ -271,8 +283,13 @@ func (m *mediaInjector) apply(messages []*schema.AgenticMessage) []*schema.Agent
 		}
 	}
 	out := make([]*schema.AgenticMessage, 0, len(messages)+len(m.injected))
+	var carriers []*schema.AgenticMessage
 	for _, message := range messages {
 		ids := resultCallIDs(message)
+		if len(ids) == 0 {
+			out = append(out, carriers...)
+			carriers = nil
+		}
 		replaced := message
 		for _, id := range ids {
 			if withMedia, ok := m.results[id]; ok {
@@ -282,11 +299,12 @@ func (m *mediaInjector) apply(messages []*schema.AgenticMessage) []*schema.Agent
 		out = append(out, replaced)
 		for _, id := range ids {
 			if carrier, ok := m.injected[id]; ok && !present[id] {
-				out = append(out, carrier)
+				carriers = append(carriers, carrier)
 				present[id] = true
 			}
 		}
 	}
+	out = append(out, carriers...)
 	if !m.policy.enabled.Load() {
 		return withoutMedia(out, m.text)
 	}

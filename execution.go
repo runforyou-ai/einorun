@@ -137,6 +137,7 @@ func (r *Runtime) assemble(ctx context.Context, request Request) (*execution, er
 	e.window = llm.ContextWindow(request.Model.ContextWindow)
 	e.contextPolicy = request.Context.withDefaults()
 	e.offloaded = &offloadStore{InMemoryBackend: filesystem.NewInMemoryBackend(), files: map[string]string{}}
+	e.offloaded.saved = func(ctx context.Context) error { return e.save(ctx) }
 	e.main = &agent{scope: AgentScope{Name: "main", Main: true}}
 
 	tools, completionTools, err := e.registerTools(ctx, e.main.scope)
