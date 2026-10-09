@@ -10,5 +10,5 @@
 - Run records, the `Feed` and `Journal` contracts and `MergeCall`.
 - `inmem` implementations and `journaltest` contract suites.
 - `provider`: chat models for the supported vendors (`vendor` presets), `embedding`, `rerank`, `discovery`, `probe` and `apierr`.
-- `toolname`: valid, stable model-visible names for external tools, with optional transliteration.
+- `toolname`: valid, deterministic model-visible names for external tools, kept apart by a digest, with optional transliteration.
 - `tools/web`: `web_search` and `web_fetch` tools over host-provided `Searcher` and `Fetcher`, with Chinese and English text.

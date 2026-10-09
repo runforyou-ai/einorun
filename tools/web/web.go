@@ -30,17 +30,18 @@ const (
 	MaxCount = 10
 )
 
-// Recency limits search results to a publication time range.
+// Recency limits search results to a publication time range: a rolling
+// window ending now.
 type Recency string
 
 const (
-	// RecencyDay is the last day.
+	// RecencyDay is the last 24 hours.
 	RecencyDay Recency = "day"
-	// RecencyWeek is the last week.
+	// RecencyWeek is the last 7 days.
 	RecencyWeek Recency = "week"
-	// RecencyMonth is the last month.
+	// RecencyMonth is the last 30 days.
 	RecencyMonth Recency = "month"
-	// RecencyYear is the last year.
+	// RecencyYear is the last 365 days.
 	RecencyYear Recency = "year"
 )
 
@@ -92,8 +93,11 @@ func (f SearcherFunc) Search(ctx context.Context, request SearchRequest) (Search
 	return f(ctx, request)
 }
 
-// Fetcher reads the main content of a web page. The address is an http or
-// https URL; the fetcher decides which addresses it may reach.
+// Fetcher reads the main content of a web page. The address is a normalized
+// http or https URL with a host and without user information. The tool
+// checks nothing else: the fetcher decides which addresses it may reach,
+// including loopback, private and metadata addresses, numeric hosts and
+// ports, and checks the parsed URL rather than prefixes of the string.
 type Fetcher interface {
 	Fetch(ctx context.Context, address string) (Document, error)
 }
@@ -119,6 +123,20 @@ type Text struct {
 	URL              string
 	// Unavailable is the error of a call when the host provides no service.
 	Unavailable string
+	// CountLimited is added to the notice of a search that asked for more
+	// than MaxCount results; %d is MaxCount.
+	CountLimited string
+	// EmptyQuery is the error of a search without a query.
+	EmptyQuery string
+	// BadRecency is the error of a search with an unknown time range; %q is
+	// the value.
+	BadRecency string
+	// BadURL is the error of a fetch of an address that is not an http or
+	// https URL; %q is the address.
+	BadURL string
+	// BadArguments is the error of arguments that are not valid JSON; %s is
+	// the decode error.
+	BadArguments string
 }
 
 // Options configures the tools.
@@ -144,29 +162,43 @@ func (o Options) text() prompt.Web {
 	override(&t.FetchDescription, o.Text.FetchDescription)
 	override(&t.URL, o.Text.URL)
 	override(&t.Unavailable, o.Text.Unavailable)
+	override(&t.CountLimited, o.Text.CountLimited)
+	override(&t.EmptyQuery, o.Text.EmptyQuery)
+	override(&t.BadRecency, o.Text.BadRecency)
+	override(&t.BadURL, o.Text.BadURL)
+	override(&t.BadArguments, o.Text.BadArguments)
 	return t
 }
 
-// NewSearchTool returns the search tool. A nil searcher makes every call fail
-// as unavailable, so the tool can be registered before a service is set up.
+// NewSearchTool returns the search tool. A nil searcher (or nil
+// SearcherFunc) makes every call fail as unavailable, so the tool can be
+// registered before a service is set up.
 func NewSearchTool(searcher Searcher, opts Options) tool.InvokableTool {
+	if f, ok := searcher.(SearcherFunc); ok && f == nil {
+		searcher = nil
+	}
 	return &searchTool{searcher: searcher, text: opts.text()}
 }
 
-// NewFetchTool returns the page reading tool. A nil fetcher makes every call
-// fail as unavailable.
+// NewFetchTool returns the page reading tool. A nil fetcher (or nil
+// FetcherFunc) makes every call fail as unavailable.
 func NewFetchTool(fetcher Fetcher, opts Options) tool.InvokableTool {
+	if f, ok := fetcher.(FetcherFunc); ok && f == nil {
+		fetcher = nil
+	}
 	return &fetchTool{fetcher: fetcher, text: opts.text()}
 }
 
 // SearchSpec returns the search tool as a tool spec: replayable and without
-// side effects.
+// side effects, so an interrupted search may be repeated. Hosts whose
+// service charges per search or has effects change the returned spec's
+// traits.
 func SearchSpec(searcher Searcher, opts Options) einorun.ToolSpec {
 	return einorun.ToolSpec{Tool: NewSearchTool(searcher, opts), Replayable: true}
 }
 
 // FetchSpec returns the page reading tool as a tool spec: replayable and
-// without side effects.
+// without side effects; hosts change the returned spec's traits as needed.
 func FetchSpec(fetcher Fetcher, opts Options) einorun.ToolSpec {
 	return einorun.ToolSpec{Tool: NewFetchTool(fetcher, opts), Replayable: true}
 }
@@ -191,29 +223,42 @@ func (t *searchTool) InvokableRun(ctx context.Context, arguments string, _ ...to
 	if t.searcher == nil {
 		return "", errors.New(t.text.Unavailable)
 	}
-	var request SearchRequest
-	if err := json.Unmarshal([]byte(arguments), &request); err != nil {
-		return "", fmt.Errorf("decode arguments: %w", err)
+	// Models write counts such as 5.0 and time ranges in any case.
+	var input struct {
+		Query   string  `json:"query"`
+		Count   float64 `json:"count"`
+		Recency string  `json:"recency"`
 	}
-	request.Query = strings.TrimSpace(request.Query)
+	if err := json.Unmarshal([]byte(arguments), &input); err != nil {
+		return "", fmt.Errorf(t.text.BadArguments, err)
+	}
+	request := SearchRequest{Query: strings.TrimSpace(input.Query), Recency: Recency(strings.ToLower(strings.TrimSpace(input.Recency)))}
 	if request.Query == "" {
 		return "", errors.New(t.text.EmptyQuery)
 	}
 	switch request.Recency {
 	case "", RecencyDay, RecencyWeek, RecencyMonth, RecencyYear:
 	default:
-		return "", fmt.Errorf(t.text.BadRecency, request.Recency)
+		return "", fmt.Errorf(t.text.BadRecency, input.Recency)
 	}
-	if request.Count <= 0 {
+	limited := input.Count > MaxCount
+	switch {
+	case input.Count < 1:
 		request.Count = DefaultCount
+	case limited:
+		request.Count = MaxCount
+	default:
+		request.Count = int(input.Count)
 	}
-	request.Count = min(request.Count, MaxCount)
 	result, err := t.searcher.Search(ctx, request)
 	if err != nil {
 		return "", err
 	}
 	if result.Items == nil {
 		result.Items = []SearchItem{}
+	}
+	if limited {
+		result.Notice = strings.TrimSpace(result.Notice + " " + fmt.Sprintf(t.text.CountLimited, MaxCount))
 	}
 	return encode(result)
 }
@@ -240,14 +285,13 @@ func (t *fetchTool) InvokableRun(ctx context.Context, arguments string, _ ...too
 		URL string `json:"url"`
 	}
 	if err := json.Unmarshal([]byte(arguments), &input); err != nil {
-		return "", fmt.Errorf("decode arguments: %w", err)
+		return "", fmt.Errorf(t.text.BadArguments, err)
 	}
-	address := strings.TrimSpace(input.URL)
-	parsed, err := url.Parse(address)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+	parsed, err := url.Parse(strings.TrimSpace(input.URL))
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" || parsed.User != nil {
 		return "", fmt.Errorf(t.text.BadURL, input.URL)
 	}
-	document, err := t.fetcher.Fetch(ctx, address)
+	document, err := t.fetcher.Fetch(ctx, parsed.String())
 	if err != nil {
 		return "", err
 	}
