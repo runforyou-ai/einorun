@@ -49,7 +49,8 @@ const (
 	StatusRunning CallStatus = "running"
 	// StatusWaiting is a call waiting for an external result.
 	StatusWaiting CallStatus = "waiting"
-	// StatusAwaitingDecision is a call submitted for a decision by the host.
+	// StatusAwaitingDecision is a call submitted for a decision by the host,
+	// or paused for one (see CallPolicy.Confirm).
 	StatusAwaitingDecision CallStatus = "awaiting_decision"
 	// StatusSucceeded is a call that returned a result.
 	StatusSucceeded CallStatus = "succeeded"
@@ -61,6 +62,9 @@ const (
 	// StatusNeedsReview is a call cut off before it finished whose side effects
 	// may or may not have happened.
 	StatusNeedsReview CallStatus = "needs_review"
+	// StatusRejected is a paused call the host rejected; the model saw the
+	// reason.
+	StatusRejected CallStatus = "rejected"
 )
 
 // Settled reports whether the call has a final outcome. Statuses the runtime
@@ -111,6 +115,19 @@ type CallCompletion struct {
 	Fixed bool            `json:"fixed"`
 }
 
+// CallDecision is the host's decision on a call paused for one (see
+// CallPolicy.Confirm). The host writes it; the runtime carries it out when
+// the run resumes.
+type CallDecision struct {
+	// Approved runs the call; otherwise it is rejected and the model sees
+	// Reason.
+	Approved bool   `json:"approved"`
+	Reason   string `json:"reason,omitempty"`
+	// Arguments, when set on an approval, replace the arguments the model
+	// gave.
+	Arguments string `json:"arguments,omitempty"`
+}
+
 // ToolCall is the record of one tool call.
 type ToolCall struct {
 	// ID is the record ID the runtime assigns.
@@ -146,6 +163,9 @@ type ToolCall struct {
 	// submitted; journals store it as is.
 	Payload    json.RawMessage
 	Completion *CallCompletion
+	// Decision is the host's decision on a call paused for one; the host owns
+	// it, and runtime snapshots never change or clear it.
+	Decision *CallDecision
 	// Notes are annotations by tool specs, guards and extensions. The runtime
 	// only adds or changes notes, so every snapshot carries all of them; a
 	// newer snapshot replaces the stored notes as a whole, so hosts keep data
@@ -175,6 +195,9 @@ func (c ToolCall) Clone() ToolCall {
 		c.Completion = &completion
 	}
 	c.Notes = maps.Clone(c.Notes)
+	if c.Decision != nil {
+		c.Decision = new(*c.Decision)
+	}
 	return c
 }
 

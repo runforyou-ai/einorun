@@ -471,12 +471,13 @@ func (r *recorder) childCalls() []ToolCall {
 	return calls
 }
 
-// awaiting reports whether a main-agent call waits for an external result.
+// awaiting reports whether a main-agent call waits for an external result or
+// for a decision.
 func (r *recorder) awaiting() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return slices.ContainsFunc(r.process, func(b Block) bool {
-		return b.Call != nil && b.Call.Handover == HandoverAwait && !b.Call.Status.Settled()
+		return b.Call != nil && ((b.Call.Handover == HandoverAwait && !b.Call.Status.Settled()) || (paused(b.Call) && b.Call.Decision == nil))
 	})
 }
 

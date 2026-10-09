@@ -10,7 +10,7 @@ Eino's ADK gives you the agent loop; einorun adds what a production host needs a
 
 - **Durable input.** A run claims input from a `Feed` and picks up messages that arrive while it works.
 - **Checkpoints and recovery.** The process is recorded in a `Journal` at safe points; a run resumes after a crash, or after waiting for an external result.
-- **Tool calls handed over.** Tools can hand a call to another system and wait (`Await`), carry on with a receipt (`Detached`) or submit it for a human decision.
+- **Tool calls handed over.** Tools can hand a call to another system and wait (`Await`), carry on with a receipt (`Detached`) submit it for a human decision, or pause the run until a person approves, rejects or edits the call, then carry it out in the same turn.
 - **Structured completion and output guards.** End a run with a structured decision, check final text before it is delivered, share one correction budget.
 - **Context management.** Large results are offloaded, old tool calls cleared, long histories summarized.
 - **Built-in extensions:** a task list (`Planning`), delegation to sub-agents (`Subagent`) and skills (`Skills`).

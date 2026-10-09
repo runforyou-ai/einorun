@@ -208,8 +208,18 @@ const (
 - A spec's `Policy` returns a `Submission{Receipt, Payload}`: the call is not
   executed; `HandoverSubmitted`, status `awaiting_decision`, `Result` is the
   receipt. The host creates the submission inside `SaveToolCall`.
-- Sub-agents cannot `Await` or `Detached` (the call fails and the model sees
-  the error); submissions are allowed.
+- A spec's `Policy` returns a `Confirmation{Payload}`: the call is paused for
+  a decision before it runs. It stays runtime-owned (`HandoverNone`) with
+  status `awaiting_decision` and the payload; the host creates the pending
+  decision inside `SaveToolCall` (and may refuse it like a submission), and
+  the run suspends after the batch. The host decides by writing the call's
+  `Decision{Approved, Reason, Arguments}`, which it owns: runtime snapshots
+  never change it. On resume the runtime carries the decision out within the
+  same turn (see Recovery). Use it when the person deciding is there and the
+  run should continue with the real result; use a submission when the
+  decision may take long and the run must go on meanwhile.
+- Sub-agents cannot `Await`, `Detached` or pause for a decision (the call
+  fails and the model sees the error); submissions are allowed.
 - A crash after the host's dispatch committed but before the tool returned is
   covered by the host: it projects its own state onto `Handover` (and the
   receipt) when building `Resume`.
@@ -232,12 +242,21 @@ runtime recovers in this order:
    model-visible result from their records (looked up by call identifier and
    model-visible name); calls without one get a cancellation note. A trailing
    output with text and no tool calls was never delivered and is dropped.
-5. Decide completion (see Completion), otherwise continue the loop.
+5. Carry out decisions on paused calls of the last model output, once the
+   rest of the run is restored: an approved call runs through the main
+   agent's tool chain (the runtime's recording, inner tool middlewares and
+   the ADK handlers, so large results are offloaded as usual), with the
+   decision's arguments when set, the model being told so; a rejected call
+   becomes `rejected` and the model sees the reason. If an approved call hands
+   itself over with `Await`, the run suspends again. Only tools registered
+   through `Request.Tools` can be carried out; others fail.
+6. Decide completion (see Completion), otherwise continue the loop.
 
 | Call | Not settled | Settled |
 |---|---|---|
 | Main agent, runtime-owned | `interrupted` (replayable or no side effects) or `needs_review` (side effects, not replayable) | Patch the result |
 | Main agent, `HandoverAwait` | The run stays suspended | Patch the result |
+| Main agent, paused for a decision | Suspended until every paused call of the batch has a decision, then carried out | Patch the result |
 | Main or sub-agent, `HandoverDetached` / `HandoverSubmitted` | Not settled; patch the receipt | Patch the receipt |
 | Sub-agent, runtime-owned | Settled like the main agent (sub-agents do not suspend) | — |
 | Sub-agent, `HandoverAwait` (crash while waiting synchronously, projected by the host) | Not suspended, not settled; the record stays with the external executor and the delegation call needs review | Kept |
@@ -358,8 +377,9 @@ type ToolSpec struct {
     PinInSummary bool
     Notes        map[string]string
 }
-type CallPolicy struct { Submit *Submission; Replayable, SideEffects *bool; Notes map[string]string }
+type CallPolicy struct { Submit *Submission; Confirm *Confirmation; Replayable, SideEffects *bool; Notes map[string]string }
 type Submission struct { Receipt string; Payload json.RawMessage }
+type Confirmation struct { Payload json.RawMessage }
 ```
 
 `AgentScope{Name, Main, ID}` identifies the agent: `ID` is `MainAgentID` for

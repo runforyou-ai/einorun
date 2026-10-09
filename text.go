@@ -35,6 +35,15 @@ type Text struct {
 	// AwaitingResult is the placeholder result of a call waiting for an
 	// external result.
 	AwaitingResult string
+	// CannotConfirm fails a call a policy paused for a decision where the run
+	// cannot suspend, or that cannot be carried out after one.
+	CannotConfirm string
+	// CallRejected is the result of a paused call the host rejected. %s is
+	// the reason.
+	CallRejected string
+	// CallEdited precedes the result of a paused call approved with changed
+	// arguments. %s is the arguments it ran with.
+	CallEdited string
 	// BatchTooMany rejects a batch with several completion tools. %s lists
 	// the completion tools.
 	BatchTooMany string
@@ -89,6 +98,9 @@ var texts = map[llm.Language]Text{
 		CannotDetach:          "这个调用无法交给外部继续执行，没有执行。",
 		CannotComplete:        "这个工具不能结束本次运行。",
 		AwaitingResult:        `{"status":"awaiting_external_result"}`,
+		CannotConfirm:         "这个调用需要确认后才能执行，当前无法等待确认，没有执行。",
+		CallRejected:          "这个调用没有获得批准，没有执行。原因：%s",
+		CallEdited:            "这个调用经确认后按修改过的参数执行：%s\n结果：\n",
 		BatchTooMany:          "%s 一次只能调用其中一个。",
 		BatchMixed:            "%s 必须单独调用，不能与其他工具同时调用。",
 		FinalNotice:           "工具调用次数已达本轮上限，请基于已获得的信息给出最终回答。",
@@ -115,6 +127,9 @@ var texts = map[llm.Language]Text{
 		CannotDetach:          "This call cannot be handed over and was not executed.",
 		CannotComplete:        "This tool cannot end the run.",
 		AwaitingResult:        `{"status":"awaiting_external_result"}`,
+		CannotConfirm:         "This call needs a confirmation before it runs, which cannot be awaited here; it was not executed.",
+		CallRejected:          "This call was not approved and did not run. Reason: %s",
+		CallEdited:            "This call ran after confirmation with changed arguments: %s\nResult:\n",
 		BatchTooMany:          "Call only one of %s at a time.",
 		BatchMixed:            "%s must be called on its own, not together with other tools.",
 		FinalNotice:           "The tool call limit for this turn is reached. Give your final answer based on what you have found.",

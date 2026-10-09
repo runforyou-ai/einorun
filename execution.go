@@ -509,6 +509,15 @@ func (e *execution) buildAgent(ctx context.Context, a *agent, instruction string
 	}
 	handlers = append(handlers, &rawCapture{agent: a})
 	middlewares := slices.Concat(outer, []compose.ToolMiddleware{e.toolMiddleware(a)}, inner)
+	if a.scope.Main {
+		a.tools = map[string]tool.BaseTool{}
+		for _, item := range tools {
+			if info, err := item.Info(ctx); err == nil {
+				a.tools[info.Name] = item
+			}
+		}
+		a.chain = slices.Concat([]compose.ToolMiddleware{e.toolMiddleware(a)}, inner, handlerToolMiddlewares(handlers))
+	}
 	built, err := adk.NewTypedChatModelAgent(ctx, &adk.TypedChatModelAgentConfig[*schema.AgenticMessage]{
 		Name: a.scope.Name, Instruction: instruction, Model: chatModel,
 		ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{
@@ -1042,7 +1051,21 @@ func (e *execution) restore(ctx context.Context) (bool, error) {
 		}
 		e.lastClaim = claim
 	}
-	return false, nil
+	// Decided calls are carried out last, once the run's state is restored:
+	// running one may save a checkpoint.
+	if last := len(messages) - 1; last >= 0 && messages[last].Role == schema.AgenticRoleTypeAssistant {
+		records := map[string]*ToolCall{}
+		for _, b := range blocks {
+			if b.Call != nil {
+				records[b.Call.CallID] = b.Call
+			}
+		}
+		if err := e.carryOutDecisions(ctx, messages[last], records); err != nil {
+			return false, err
+		}
+	}
+	// An approved call may hand itself over to an external executor.
+	return e.recorder.awaiting(), nil
 }
 
 // restoreExtensions restores the state of stateful extensions. The
@@ -1126,6 +1149,12 @@ func settleInterrupted(blocks []Block, children []ToolCall, at time.Time, text *
 	}
 	settle := func(call *ToolCall, main bool) {
 		if call.Status.Settled() || call.Handover == HandoverDetached || call.Handover == HandoverSubmitted {
+			return
+		}
+		// A paused call waits for its decision, then the runtime carries it
+		// out; only main-agent calls pause.
+		if main && paused(call) {
+			waiting = waiting || call.Decision == nil
 			return
 		}
 		if call.Handover == HandoverAwait {
