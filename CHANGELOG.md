@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.1.0 - 2026-10-09
+
+First release.
+
 - `Runtime.Run`: durable runs with claimed input, preemption at safe points, process records with revisions, checkpoints and recovery, handed-over and submitted calls, the completion protocol, guards and extensions. `MemoryJournal` is the default journal.
 - Context management (`ContextPolicy`): large results offloaded with previews and read back, older tool calls cleared, long contexts summarized with pinned calls kept.
 - `AttachMedia`: tool results with host media, passed to the model within the run's media budget, inside the result or as a following user message.
