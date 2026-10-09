@@ -1,6 +1,10 @@
 // Package journaltest checks implementations of einorun.Journal and
 // einorun.Feed against their contracts. Hosts run these suites against their
 // persistent implementations in their own tests.
+//
+// Every record ID and ModelCallID the suites write is a fresh UUIDv7, so the
+// suites run against schemas with UUID columns and share one database across
+// harnesses. Payloads are compared as JSON values.
 package journaltest
 
 import (
@@ -8,11 +12,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/runforyou-ai/einorun"
+	"github.com/runforyou-ai/einorun/llm"
 )
 
 // JournalHarness gives the suite access to one empty run in the
@@ -39,7 +45,7 @@ type JournalHarness struct {
 func RunJournal(t *testing.T, newHarness func(t *testing.T) JournalHarness) {
 	for _, c := range []struct {
 		name string
-		run  func(*testing.T, JournalHarness)
+		run  func(*testing.T, JournalHarness, ids)
 	}{
 		{"newer revisions win", testNewerRevisionsWin},
 		{"repeated writes are stable", testRepeatedWrite},
@@ -56,7 +62,7 @@ func RunJournal(t *testing.T, newHarness func(t *testing.T) JournalHarness) {
 		{"concurrent writes to one call", testConcurrentOneCall},
 		{"invalid calls are refused", testInvalid},
 	} {
-		t.Run(c.name, func(t *testing.T) { c.run(t, newHarness(t)) })
+		t.Run(c.name, func(t *testing.T) { c.run(t, newHarness(t), ids{}) })
 	}
 }
 
@@ -64,8 +70,13 @@ func RunJournal(t *testing.T, newHarness func(t *testing.T) JournalHarness) {
 // implementation under test.
 type FeedHarness struct {
 	Feed einorun.Feed
-	// Append adds a message and returns its sequence number.
-	Append func(ctx context.Context, message einorun.Message) (int64, error)
+	// Append adds a message like message to the conversation and returns its
+	// sequence number and the message as Claim hands it back. Hosts that
+	// derive messages from their own records may assign their own ID and
+	// revision and keep only the fields they store; the suite compares claims
+	// with the returned message. The suite appends user and assistant
+	// messages, with and without media and meta.
+	Append func(ctx context.Context, message einorun.Message) (int64, einorun.Message, error)
 	// Consume marks input up to seq as consumed.
 	Consume func(ctx context.Context, seq int64) error
 }
@@ -88,10 +99,43 @@ func RunFeed(t *testing.T, newHarness func(t *testing.T) FeedHarness) {
 
 var at = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
+// ids gives each name used by one test a fresh UUIDv7.
+type ids map[string]string
+
+// of returns the ID of name.
+func (n ids) of(name string) string {
+	if id, ok := n[name]; ok {
+		return id
+	}
+	n[name] = llm.NewModelCallID()
+	return n[name]
+}
+
 // child returns a sub-agent call snapshot; sub-agent calls come back in
 // Resume.Calls without needing a block.
-func child(id string, rev uint64, status einorun.CallStatus) einorun.ToolCall {
-	return einorun.ToolCall{ID: id, ParentID: "parent", CallID: "c-" + id, Name: "tool", Arguments: "{}", Rev: rev, Status: status, StartedAt: &at}
+func child(n ids, name string, rev uint64, status einorun.CallStatus) einorun.ToolCall {
+	return einorun.ToolCall{ID: n.of(name), ParentID: n.of("parent"), ModelCallID: n.of("model"), CallID: "c-" + name, Name: "tool",
+		Arguments: "{}", Rev: rev, Status: status, StartedAt: &at}
+}
+
+// mainCall returns a main-agent call snapshot.
+func mainCall(n ids, name string, rev uint64, status einorun.CallStatus) einorun.ToolCall {
+	call := child(n, name, rev, status)
+	call.ParentID, call.StartedAt = "", nil
+	return call
+}
+
+// sameJSON reports whether a and b hold the same JSON value; an empty payload
+// only equals another empty payload.
+func sameJSON(a, b []byte) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return len(a) == len(b)
+	}
+	var x, y any
+	if json.Unmarshal(a, &x) != nil || json.Unmarshal(b, &y) != nil {
+		return string(a) == string(b)
+	}
+	return reflect.DeepEqual(x, y)
 }
 
 func text(s string) *string { return &s }
@@ -108,9 +152,9 @@ func load(t *testing.T, h JournalHarness) einorun.Resume {
 
 // find returns the record of the call "a", which most journal tests use. It
 // checks that Load hands back the same record, as resuming would see it.
-func find(t *testing.T, h JournalHarness) einorun.ToolCall {
+func find(t *testing.T, h JournalHarness, n ids) einorun.ToolCall {
 	t.Helper()
-	call, ok := lookup(t, h, "a")
+	call, ok := lookup(t, h, n.of("a"))
 	if !ok {
 		t.Fatal("call a not found")
 	}
@@ -149,7 +193,7 @@ func differ(a, b einorun.ToolCall) string {
 		return "Error"
 	case a.Handover != b.Handover:
 		return "Handover"
-	case string(a.Payload) != string(b.Payload):
+	case !sameJSON(a.Payload, b.Payload):
 		return "Payload"
 	case a.Name != b.Name || a.Arguments != b.Arguments:
 		return "Name or Arguments"
@@ -192,173 +236,174 @@ func str(p *string) string {
 	return *p
 }
 
-func testNewerRevisionsWin(t *testing.T, h JournalHarness) {
-	running := child("a", 2, einorun.StatusRunning)
+func testNewerRevisionsWin(t *testing.T, h JournalHarness, n ids) {
+	running := child(n, "a", 2, einorun.StatusRunning)
 	running.Arguments = `{"x":2}`
-	queued := child("a", 1, einorun.StatusQueued)
+	queued := child(n, "a", 1, einorun.StatusQueued)
 	save(t, h, running)
 	save(t, h, queued) // arrives late
-	got := find(t, h)
+	got := find(t, h, n)
 	if got.Status != einorun.StatusRunning || got.Rev != 2 || got.Arguments != `{"x":2}` {
 		t.Fatalf("got %s rev %d %s, want running rev 2", got.Status, got.Rev, got.Arguments)
 	}
 }
 
-func testRepeatedWrite(t *testing.T, h JournalHarness) {
-	done := child("a", 3, einorun.StatusSucceeded)
+func testRepeatedWrite(t *testing.T, h JournalHarness, n ids) {
+	done := child(n, "a", 3, einorun.StatusSucceeded)
 	done.Result, done.CompletedAt, done.Notes = text("ok"), &at, map[string]string{"k": "v"}
 	save(t, h, done)
 	save(t, h, done)
-	got := find(t, h)
+	got := find(t, h, n)
 	if got.Status != einorun.StatusSucceeded || str(got.Result) != "ok" || got.Rev != 3 || got.Notes["k"] != "v" {
 		t.Fatalf("repeated write changed the record: %+v", got)
 	}
 }
 
-func testStaleStep(t *testing.T, h JournalHarness) {
+func testStaleStep(t *testing.T, h JournalHarness, n ids) {
 	ctx := context.Background()
-	save(t, h, child("a", 1, einorun.StatusQueued))
-	done := child("a", 3, einorun.StatusSucceeded)
+	save(t, h, child(n, "a", 1, einorun.StatusQueued))
+	done := child(n, "a", 3, einorun.StatusSucceeded)
 	done.Result, done.CompletedAt = text("ok"), &at
 	save(t, h, done)
-	stale := child("a", 2, einorun.StatusRunning)
+	stale := child(n, "a", 2, einorun.StatusRunning)
 	if err := h.Journal.SaveStep(ctx, einorun.Step{Changes: einorun.Changes{Calls: []einorun.ToolCall{stale}}, State: []byte("s")}); err != nil {
 		t.Fatal(err)
 	}
-	if got := find(t, h); got.Status != einorun.StatusSucceeded || str(got.Result) != "ok" {
+	if got := find(t, h, n); got.Status != einorun.StatusSucceeded || str(got.Result) != "ok" {
 		t.Fatalf("stale snapshot won: %+v", got)
 	}
 }
 
-func testSettledFinal(t *testing.T, h JournalHarness) {
-	failed := child("a", 1, einorun.StatusFailed)
+func testSettledFinal(t *testing.T, h JournalHarness, n ids) {
+	failed := child(n, "a", 1, einorun.StatusFailed)
 	failed.Error, failed.CompletedAt = text("boom"), &at
 	save(t, h, failed)
 	later := at.Add(time.Hour)
-	retry := child("a", 2, einorun.StatusSucceeded)
+	retry := child(n, "a", 2, einorun.StatusSucceeded)
 	retry.Result, retry.CompletedAt, retry.Payload = text("ok"), &later, json.RawMessage(`{}`)
 	retry.Handover = einorun.HandoverAwait
 	save(t, h, retry)
-	got := find(t, h)
+	got := find(t, h, n)
 	if got.Status != einorun.StatusFailed || str(got.Error) != "boom" || got.Result != nil || !got.CompletedAt.Equal(at) ||
 		len(got.Payload) != 0 || got.Handover != einorun.HandoverNone {
 		t.Fatalf("settled outcome changed: %+v", got)
 	}
 }
 
-func testRuntimeHandover(t *testing.T, h JournalHarness) {
-	save(t, h, child("a", 1, einorun.StatusRunning))
-	detached := child("a", 2, einorun.StatusRunning)
+func testRuntimeHandover(t *testing.T, h JournalHarness, n ids) {
+	save(t, h, child(n, "a", 1, einorun.StatusRunning))
+	detached := child(n, "a", 2, einorun.StatusRunning)
 	detached.Handover, detached.Result, detached.Payload = einorun.HandoverDetached, text("receipt"), json.RawMessage(`{"session":"s1"}`)
 	save(t, h, detached)
-	late := child("a", 3, einorun.StatusInterrupted)
+	late := child(n, "a", 3, einorun.StatusInterrupted)
 	late.Result = text("interrupted")
 	save(t, h, late)
-	got := find(t, h)
+	got := find(t, h, n)
 	if got.Handover != einorun.HandoverDetached || str(got.Result) != "receipt" || got.Status != einorun.StatusRunning {
 		t.Fatalf("handover not kept: %+v", got)
 	}
-	if string(got.Payload) != `{"session":"s1"}` {
+	if !sameJSON(got.Payload, []byte(`{"session":"s1"}`)) {
 		t.Fatalf("payload %s", got.Payload)
 	}
 }
 
-func testHostHandoverFirst(t *testing.T, h JournalHarness) {
-	save(t, h, child("a", 1, einorun.StatusRunning))
-	external(t, h, einorun.ToolCall{ID: "a", Status: einorun.StatusQueued, Handover: einorun.HandoverDetached})
-	if got := find(t, h); got.Name != "tool" || got.Arguments != "{}" {
+func testHostHandoverFirst(t *testing.T, h JournalHarness, n ids) {
+	save(t, h, child(n, "a", 1, einorun.StatusRunning))
+	external(t, h, einorun.ToolCall{ID: n.of("a"), Status: einorun.StatusQueued, Handover: einorun.HandoverDetached})
+	if got := find(t, h, n); got.Name != "tool" || got.Arguments != "{}" {
 		t.Fatalf("external write lost fields: %+v", got)
 	}
-	detached := child("a", 2, einorun.StatusRunning)
+	detached := child(n, "a", 2, einorun.StatusRunning)
 	detached.Handover, detached.Result, detached.Payload = einorun.HandoverDetached, text("receipt"), json.RawMessage(`{"op":1}`)
 	save(t, h, detached)
-	got := find(t, h)
+	got := find(t, h, n)
 	if got.Status != einorun.StatusQueued || got.Handover != einorun.HandoverDetached {
 		t.Fatalf("external status overwritten: %+v", got)
 	}
-	if str(got.Result) != "receipt" || string(got.Payload) != `{"op":1}` {
+	if str(got.Result) != "receipt" || !sameJSON(got.Payload, []byte(`{"op":1}`)) {
 		t.Fatalf("receipt or payload not filled in: %+v", got)
 	}
-	again := child("a", 3, einorun.StatusRunning)
+	again := child(n, "a", 3, einorun.StatusRunning)
 	again.Handover, again.Result, again.Payload = einorun.HandoverDetached, text("other"), json.RawMessage(`{"op":2}`)
 	save(t, h, again)
-	got = find(t, h)
-	if str(got.Result) != "receipt" || string(got.Payload) != `{"op":1}` {
+	got = find(t, h, n)
+	if str(got.Result) != "receipt" || !sameJSON(got.Payload, []byte(`{"op":1}`)) {
 		t.Fatalf("receipt or payload replaced: %+v", got)
 	}
 }
 
-func testExternalResultFirst(t *testing.T, h JournalHarness) {
-	save(t, h, child("a", 1, einorun.StatusRunning))
-	external(t, h, einorun.ToolCall{ID: "a", Status: einorun.StatusSucceeded, Result: text("external"), CompletedAt: &at, Handover: einorun.HandoverAwait})
-	await := child("a", 2, einorun.StatusWaiting)
+func testExternalResultFirst(t *testing.T, h JournalHarness, n ids) {
+	save(t, h, child(n, "a", 1, einorun.StatusRunning))
+	external(t, h, einorun.ToolCall{ID: n.of("a"), Status: einorun.StatusSucceeded, Result: text("external"), CompletedAt: &at, Handover: einorun.HandoverAwait})
+	await := child(n, "a", 2, einorun.StatusWaiting)
 	await.Handover, await.Payload = einorun.HandoverAwait, json.RawMessage(`{"op":1}`)
 	save(t, h, await)
-	got := find(t, h)
+	got := find(t, h, n)
 	if got.Status != einorun.StatusSucceeded || str(got.Result) != "external" {
 		t.Fatalf("external result overwritten: %+v", got)
 	}
-	if string(got.Payload) != `{"op":1}` {
+	if !sameJSON(got.Payload, []byte(`{"op":1}`)) {
 		t.Fatalf("payload not filled in after an external result: %s", got.Payload)
 	}
 }
 
-func testStaleHandoverFill(t *testing.T, h JournalHarness) {
-	save(t, h, child("a", 5, einorun.StatusRunning))
-	external(t, h, einorun.ToolCall{ID: "a", Status: einorun.StatusQueued, Handover: einorun.HandoverAwait})
-	stale := child("a", 2, einorun.StatusWaiting)
+func testStaleHandoverFill(t *testing.T, h JournalHarness, n ids) {
+	save(t, h, child(n, "a", 5, einorun.StatusRunning))
+	external(t, h, einorun.ToolCall{ID: n.of("a"), Status: einorun.StatusQueued, Handover: einorun.HandoverAwait})
+	stale := child(n, "a", 2, einorun.StatusWaiting)
 	stale.Handover, stale.Result, stale.Payload = einorun.HandoverAwait, text("receipt"), json.RawMessage(`{"op":1}`)
 	save(t, h, stale)
-	got := find(t, h)
+	got := find(t, h, n)
 	if got.Result != nil || len(got.Payload) != 0 || got.Status != einorun.StatusQueued {
 		t.Fatalf("stale write filled the handover: %+v", got)
 	}
 }
 
-func testNonHandoverFill(t *testing.T, h JournalHarness) {
-	save(t, h, child("a", 1, einorun.StatusRunning))
-	external(t, h, einorun.ToolCall{ID: "a", Status: einorun.StatusQueued, Handover: einorun.HandoverAwait})
-	interrupted := child("a", 2, einorun.StatusInterrupted)
+func testNonHandoverFill(t *testing.T, h JournalHarness, n ids) {
+	save(t, h, child(n, "a", 1, einorun.StatusRunning))
+	external(t, h, einorun.ToolCall{ID: n.of("a"), Status: einorun.StatusQueued, Handover: einorun.HandoverAwait})
+	interrupted := child(n, "a", 2, einorun.StatusInterrupted)
 	interrupted.Result = text("interrupted")
 	save(t, h, interrupted)
-	got := find(t, h)
+	got := find(t, h, n)
 	if got.Result != nil || got.Status != einorun.StatusQueued {
 		t.Fatalf("a settlement became the receipt: %+v", got)
 	}
 }
 
-func testNotes(t *testing.T, h JournalHarness) {
-	first := child("a", 1, einorun.StatusRunning)
+func testNotes(t *testing.T, h JournalHarness, n ids) {
+	first := child(n, "a", 1, einorun.StatusRunning)
 	first.Notes = map[string]string{"k": "old"}
-	second := child("a", 2, einorun.StatusSucceeded)
+	second := child(n, "a", 2, einorun.StatusSucceeded)
 	second.Result, second.Notes = text("r"), map[string]string{"k": "new", "evidence": "true"}
-	third := child("a", 3, einorun.StatusSucceeded)
+	third := child(n, "a", 3, einorun.StatusSucceeded)
 	third.Result, third.Notes = text("r"), map[string]string{"k": "new", "evidence": "true", "extra": "x"}
 	// Out of order: the newest snapshot wins whatever arrives later.
 	save(t, h, third)
 	save(t, h, first)
 	save(t, h, second)
 	want := map[string]string{"k": "new", "evidence": "true", "extra": "x"}
-	if got := find(t, h); !maps.Equal(got.Notes, want) {
+	if got := find(t, h, n); !maps.Equal(got.Notes, want) {
 		t.Fatalf("notes %v, want %v", got.Notes, want)
 	}
 	// Notes still change after the outcome is final.
 	fourth := third.Clone()
 	fourth.Rev, fourth.Notes["late"] = 4, "y"
 	save(t, h, fourth)
-	if got := find(t, h); got.Notes["late"] != "y" {
+	if got := find(t, h, n); got.Notes["late"] != "y" {
 		t.Fatalf("late note lost: %v", got.Notes)
 	}
 }
 
-func testSteps(t *testing.T, h JournalHarness) {
+func testSteps(t *testing.T, h JournalHarness, n ids) {
 	ctx := context.Background()
-	main := einorun.ToolCall{ID: "a", CallID: "c-a", Name: "tool", Arguments: "{}", Rev: 1, Status: einorun.StatusRunning, StartedAt: &at}
+	main := mainCall(n, "a", 1, einorun.StatusRunning)
+	main.StartedAt = &at
 	step := einorun.Step{
 		Changes: einorun.Changes{Blocks: []einorun.Block{
-			{ID: "b1", Position: 1, Kind: einorun.KindContent, Text: "hello"},
-			{ID: "b2", Position: 2, Kind: einorun.KindToolCall, Call: &main},
-		}, Calls: []einorun.ToolCall{main, child("s", 1, einorun.StatusRunning)}},
+			{ID: n.of("b1"), Position: 1, ModelCallID: n.of("model"), Kind: einorun.KindContent, Text: "hello"},
+			{ID: n.of("b2"), Position: 2, ModelCallID: n.of("model"), Kind: einorun.KindToolCall, Call: &main},
+		}, Calls: []einorun.ToolCall{main, child(n, "s", 1, einorun.StatusRunning)}},
 		Usage:      einorun.Usage{Input: 1, Output: 2, Total: 3},
 		Plan:       []einorun.PlanTask{{ID: "1", Subject: "s", Status: "pending"}},
 		Completion: &einorun.Completion{Source: einorun.FromGuard, Value: json.RawMessage(`{"a":1}`), Fixed: true},
@@ -371,13 +416,13 @@ func testSteps(t *testing.T, h JournalHarness) {
 	if string(resume.State) != "state-1" || len(resume.Plan) != 1 || resume.Plan[0].Subject != "s" {
 		t.Fatalf("state %q plan %+v", resume.State, resume.Plan)
 	}
-	if resume.Completion == nil || resume.Completion.Source != einorun.FromGuard || !resume.Completion.Fixed || string(resume.Completion.Value) != `{"a":1}` {
+	if resume.Completion == nil || resume.Completion.Source != einorun.FromGuard || !resume.Completion.Fixed || !sameJSON(resume.Completion.Value, []byte(`{"a":1}`)) {
 		t.Fatalf("completion %+v", resume.Completion)
 	}
-	if len(resume.Blocks) != 2 || resume.Blocks[0].Text != "hello" || resume.Blocks[1].Call == nil || resume.Blocks[1].Call.ID != "a" {
+	if len(resume.Blocks) != 2 || resume.Blocks[0].Text != "hello" || resume.Blocks[1].Call == nil || resume.Blocks[1].Call.ID != n.of("a") {
 		t.Fatalf("blocks %+v", resume.Blocks)
 	}
-	if len(resume.Calls) != 1 || resume.Calls[0].ID != "s" {
+	if len(resume.Calls) != 1 || resume.Calls[0].ID != n.of("s") {
 		t.Fatalf("sub-agent calls %+v", resume.Calls)
 	}
 	if h.Usage != nil {
@@ -386,7 +431,7 @@ func testSteps(t *testing.T, h JournalHarness) {
 			t.Fatalf("usage %+v %v", usage, err)
 		}
 	}
-	second := einorun.Step{Changes: einorun.Changes{RemovedBlocks: []string{"b2"}, RemovedCalls: []string{"a"}}, State: []byte("state-2")}
+	second := einorun.Step{Changes: einorun.Changes{RemovedBlocks: []string{n.of("b2")}, RemovedCalls: []string{n.of("a")}}, State: []byte("state-2")}
 	if err := h.Journal.SaveStep(ctx, second); err != nil {
 		t.Fatal(err)
 	}
@@ -394,21 +439,21 @@ func testSteps(t *testing.T, h JournalHarness) {
 	if string(resume.State) != "state-2" || resume.Completion != nil || len(resume.Plan) != 0 {
 		t.Fatalf("second step state %q completion %+v plan %+v", resume.State, resume.Completion, resume.Plan)
 	}
-	if len(resume.Blocks) != 1 || resume.Blocks[0].ID != "b1" {
+	if len(resume.Blocks) != 1 || resume.Blocks[0].ID != n.of("b1") {
 		t.Fatalf("blocks after removal %+v", resume.Blocks)
 	}
-	if _, ok := lookup(t, h, "a"); ok {
+	if _, ok := lookup(t, h, n.of("a")); ok {
 		t.Fatal("removed call is still there")
 	}
-	if _, ok := lookup(t, h, "s"); !ok {
+	if _, ok := lookup(t, h, n.of("s")); !ok {
 		t.Fatal("a call that was not removed is gone")
 	}
 }
 
-func testBlockLinks(t *testing.T, h JournalHarness) {
+func testBlockLinks(t *testing.T, h JournalHarness, n ids) {
 	ctx := context.Background()
-	queued := einorun.ToolCall{ID: "a", CallID: "c-a", Name: "tool", Arguments: "{}", Rev: 1, Status: einorun.StatusQueued}
-	block := einorun.Block{ID: "b", Position: 1, Kind: einorun.KindToolCall, Call: &queued}
+	queued := mainCall(n, "a", 1, einorun.StatusQueued)
+	block := einorun.Block{ID: n.of("b"), Position: 1, ModelCallID: n.of("model"), Kind: einorun.KindToolCall, Call: &queued}
 	if err := h.Journal.SaveStep(ctx, einorun.Step{Changes: einorun.Changes{Blocks: []einorun.Block{block}, Calls: []einorun.ToolCall{queued}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -424,21 +469,21 @@ func testBlockLinks(t *testing.T, h JournalHarness) {
 		t.Fatalf("block call %+v", resume.Blocks)
 	}
 	for _, c := range resume.Calls {
-		if c.ID == "a" {
+		if c.ID == n.of("a") {
 			t.Fatal("main call listed in Resume.Calls")
 		}
 	}
 }
 
-func testConcurrentOneCall(t *testing.T, h JournalHarness) {
+func testConcurrentOneCall(t *testing.T, h JournalHarness, n ids) {
 	ctx := context.Background()
-	save(t, h, child("a", 1, einorun.StatusQueued))
+	save(t, h, child(n, "a", 1, einorun.StatusQueued))
 	var wg sync.WaitGroup
 	for rev := uint64(2); rev <= 21; rev++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c := child("a", rev, einorun.StatusRunning)
+			c := child(n, "a", rev, einorun.StatusRunning)
 			c.Arguments = fmt.Sprintf(`{"rev":%d}`, rev)
 			if err := h.Journal.SaveToolCall(ctx, c); err != nil {
 				t.Error(err)
@@ -450,21 +495,21 @@ func testConcurrentOneCall(t *testing.T, h JournalHarness) {
 	go func() {
 		defer wg.Done()
 		for rev := uint64(1); rev <= 20; rev++ {
-			stale := child("a", rev, einorun.StatusQueued)
+			stale := child(n, "a", rev, einorun.StatusQueued)
 			if err := h.Journal.SaveStep(ctx, einorun.Step{Changes: einorun.Changes{Calls: []einorun.ToolCall{stale}}}); err != nil {
 				t.Error(err)
 			}
 		}
 	}()
 	wg.Wait()
-	got := find(t, h)
+	got := find(t, h, n)
 	if got.Rev != 21 || got.Arguments != `{"rev":21}` || got.Status != einorun.StatusRunning {
 		t.Fatalf("lost update: rev %d %s %s", got.Rev, got.Arguments, got.Status)
 	}
 }
 
-func testInvalid(t *testing.T, h JournalHarness) {
-	if err := h.Journal.SaveToolCall(context.Background(), einorun.ToolCall{ID: "a", Rev: 1}); err == nil {
+func testInvalid(t *testing.T, h JournalHarness, n ids) {
+	if err := h.Journal.SaveToolCall(context.Background(), einorun.ToolCall{ID: n.of("a"), Rev: 1}); err == nil {
 		t.Fatal("call without a status accepted")
 	}
 	if err := h.Journal.SaveToolCall(context.Background(), einorun.ToolCall{Rev: 1, Status: einorun.StatusQueued}); err == nil {
@@ -472,13 +517,37 @@ func testInvalid(t *testing.T, h JournalHarness) {
 	}
 }
 
-func appendUser(t *testing.T, h FeedHarness, id string) int64 {
+// appendMessage appends message and returns its sequence number and the
+// message as the feed hands it back.
+func appendMessage(t *testing.T, h FeedHarness, message einorun.Message) (int64, einorun.Message) {
 	t.Helper()
-	seq, err := h.Append(context.Background(), einorun.Message{ID: id, Revision: "1", Role: einorun.RoleUser, Content: id})
+	seq, stored, err := h.Append(context.Background(), message)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return seq
+	return seq, stored
+}
+
+// appendUser appends a user message and returns its sequence number and ID.
+func appendUser(t *testing.T, h FeedHarness, content string) (int64, string) {
+	t.Helper()
+	seq, stored := appendMessage(t, h, einorun.Message{ID: llm.NewModelCallID(), Revision: "1", Role: einorun.RoleUser, Content: content})
+	return seq, stored.ID
+}
+
+// sameMessage names the first field in which a and b differ, or returns "".
+func sameMessage(a, b einorun.Message) string {
+	switch {
+	case a.ID != b.ID || a.Revision != b.Revision:
+		return "ID or Revision"
+	case a.Role != b.Role || a.Content != b.Content:
+		return "Role or Content"
+	case (a.Media == nil) != (b.Media == nil) || (a.Media != nil && *a.Media != *b.Media):
+		return "Media"
+	case !maps.Equal(a.Meta, b.Meta):
+		return "Meta"
+	}
+	return ""
 }
 
 func testPendingClaim(t *testing.T, h FeedHarness) {
@@ -486,8 +555,8 @@ func testPendingClaim(t *testing.T, h FeedHarness) {
 	if latest, err := h.Feed.Pending(ctx, 0); err != nil || latest != 0 {
 		t.Fatalf("empty pending %d %v", latest, err)
 	}
-	first := appendUser(t, h, "m1")
-	second := appendUser(t, h, "m2")
+	first, _ := appendUser(t, h, "m1")
+	second, secondID := appendUser(t, h, "m2")
 	latest, err := h.Feed.Pending(ctx, 0)
 	if err != nil || latest != second {
 		t.Fatalf("pending %d %v, want %d", latest, err, second)
@@ -503,42 +572,50 @@ func testPendingClaim(t *testing.T, h FeedHarness) {
 		t.Fatalf("claim %+v", claim)
 	}
 	claim, err = h.Feed.Claim(ctx, second)
-	if err != nil || claim.EndSeq != second || len(claim.Messages) < 2 || claim.Messages[len(claim.Messages)-1].ID != "m2" {
+	if err != nil || claim.EndSeq != second || len(claim.Messages) < 2 || claim.Messages[len(claim.Messages)-1].ID != secondID {
 		t.Fatalf("claim snapshot %+v %v", claim, err)
 	}
 }
 
 func testMessageRoundTrip(t *testing.T, h FeedHarness) {
 	ctx := context.Background()
-	media := &einorun.MediaRef{Key: "k", MIME: "image/png", SHA256: "h", Size: 3}
-	in := einorun.Message{ID: "m", Revision: "r2", Role: einorun.RoleAssistant, Content: "c", Media: media, Meta: map[string]string{"fact": "true"}}
-	seq, err := h.Append(ctx, in)
-	if err != nil {
-		t.Fatal(err)
-	}
-	claim, err := h.Feed.Claim(ctx, seq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	out := claim.Messages[len(claim.Messages)-1]
-	if out.ID != in.ID || out.Revision != in.Revision || out.Role != in.Role || out.Content != in.Content ||
-		out.Media == nil || *out.Media != *media || !maps.Equal(out.Meta, in.Meta) {
-		t.Fatalf("message %+v, want %+v", out, in)
-	}
-	// Changing the returned snapshot does not change the conversation.
-	out.Meta["fact"], out.Media.Key = "false", "other"
-	again, err := h.Feed.Claim(ctx, seq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if last := again.Messages[len(again.Messages)-1]; last.Meta["fact"] != "true" || last.Media.Key != "k" {
-		t.Fatalf("snapshot shares memory with the feed: %+v", last)
+	for _, in := range []einorun.Message{
+		{ID: llm.NewModelCallID(), Revision: "r2", Role: einorun.RoleAssistant, Content: "answer"},
+		{ID: llm.NewModelCallID(), Revision: "r1", Role: einorun.RoleUser, Content: "look",
+			Media: &einorun.MediaRef{Key: "k", MIME: "image/png", SHA256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", Size: 4},
+			Meta:  map[string]string{"fact": "true"}},
+	} {
+		seq, stored := appendMessage(t, h, in)
+		claim, err := h.Feed.Claim(ctx, seq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := claim.Messages[len(claim.Messages)-1]
+		if diff := sameMessage(out, stored); diff != "" {
+			t.Fatalf("claimed message differs from the stored one in %s: %+v, want %+v", diff, out, stored)
+		}
+		// Changing the returned snapshot does not change the conversation.
+		if out.Meta != nil {
+			for k := range out.Meta {
+				out.Meta[k] += "-changed"
+			}
+		}
+		if out.Media != nil {
+			out.Media.Key += "-changed"
+		}
+		again, err := h.Feed.Claim(ctx, seq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if diff := sameMessage(again.Messages[len(again.Messages)-1], stored); diff != "" {
+			t.Fatalf("snapshot shares memory with the feed: %s", diff)
+		}
 	}
 }
 
 func testReplay(t *testing.T, h FeedHarness) {
 	ctx := context.Background()
-	seq := appendUser(t, h, "m1")
+	seq, _ := appendUser(t, h, "m1")
 	first, err := h.Feed.Claim(ctx, seq)
 	if err != nil {
 		t.Fatal(err)
@@ -552,7 +629,7 @@ func testReplay(t *testing.T, h FeedHarness) {
 
 func testConsumed(t *testing.T, h FeedHarness) {
 	ctx := context.Background()
-	first := appendUser(t, h, "m1")
+	first, _ := appendUser(t, h, "m1")
 	if err := h.Consume(ctx, first); err != nil {
 		t.Fatal(err)
 	}
@@ -562,7 +639,7 @@ func testConsumed(t *testing.T, h FeedHarness) {
 	if _, err := h.Feed.Claim(ctx, first); err == nil {
 		t.Fatal("claimed consumed input")
 	}
-	second := appendUser(t, h, "m2")
+	second, _ := appendUser(t, h, "m2")
 	if latest, err := h.Feed.Pending(ctx, 0); err != nil || latest != second {
 		t.Fatalf("pending after new input %d %v", latest, err)
 	}

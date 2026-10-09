@@ -10,7 +10,6 @@ import (
 
 	"github.com/cloudwego/eino/schema"
 
-	"github.com/runforyou-ai/einorun/internal/prompt"
 	"github.com/runforyou-ai/einorun/llm"
 )
 
@@ -283,7 +282,7 @@ func carriesMedia(input []*schema.AgenticMessage) bool {
 
 // withoutMedia returns input without media: inline attachments are dropped
 // (their messages keep the text) and non-text tool results become notes.
-func withoutMedia(input []*schema.AgenticMessage, text *prompt.Runtime) []*schema.AgenticMessage {
+func withoutMedia(input []*schema.AgenticMessage, text *Text) []*schema.AgenticMessage {
 	output := make([]*schema.AgenticMessage, len(input))
 	for i, m := range input {
 		if !carriesMedia([]*schema.AgenticMessage{m}) {

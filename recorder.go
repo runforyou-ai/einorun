@@ -26,6 +26,8 @@ type toolEntry struct {
 	name string
 	// describe returns the description shown for a call, by its arguments.
 	describe func(arguments string) string
+	// builtin marks a tool the runtime or a built-in extension added.
+	builtin bool
 }
 
 // recorder keeps the process of one execution attempt: blocks in model

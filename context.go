@@ -19,7 +19,6 @@ import (
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 
-	"github.com/runforyou-ai/einorun/internal/prompt"
 	"github.com/runforyou-ai/einorun/llm"
 )
 
@@ -287,7 +286,7 @@ type summarizer struct {
 	counter func(ctx context.Context, messages []*schema.AgenticMessage, tools []*schema.ToolInfo) (int64, error)
 	pin     func(messages []*schema.AgenticMessage) map[string]bool
 	runID   string
-	text    *prompt.Runtime
+	text    *Text
 
 	mu         sync.Mutex
 	keepFromID string

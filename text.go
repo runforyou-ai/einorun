@@ -1,7 +1,15 @@
-package prompt
+package einorun
 
-// Runtime is the model-facing text the runtime writes in one language.
-type Runtime struct {
+import (
+	"reflect"
+
+	"github.com/runforyou-ai/einorun/llm"
+)
+
+// Text is the model-facing text the runtime writes. Config.Text overrides
+// the default text of the run's language field by field: empty fields keep
+// the default. Format verbs are documented per field and must be kept.
+type Text struct {
 	// Cancelled is the result of a call that never got one because other
 	// input arrived first. %[1]s is the tool name, %[2]s the call identifier.
 	Cancelled string
@@ -67,8 +75,9 @@ type Runtime struct {
 	SkillForkResult string
 }
 
-var runtimes = map[string]*Runtime{
-	"zh": {
+// texts are the default text by language.
+var texts = map[llm.Language]Text{
+	llm.Chinese: {
 		Cancelled:             "工具调用 %[1]s（ID 为 %[2]s）已被取消——在其完成之前收到了另一条消息。",
 		InterruptedReplayable: "执行被中断，没有返回结果，需要时可以重新调用。",
 		Interrupted:           "执行被中断，结果未知。",
@@ -94,7 +103,7 @@ var runtimes = map[string]*Runtime{
 		SubagentNoResult:      "子 Agent 没有给出结果。",
 		SkillForkResult:       "技能 %[1]s 已由子 Agent 执行完成，结果：\n%[2]s",
 	},
-	"en": {
+	llm.English: {
 		Cancelled:             "Tool call %[1]s (ID %[2]s) was cancelled: another message arrived before it finished.",
 		InterruptedReplayable: "The call was interrupted and returned no result; call it again if needed.",
 		Interrupted:           "The call was interrupted; its outcome is unknown.",
@@ -122,10 +131,22 @@ var runtimes = map[string]*Runtime{
 	},
 }
 
-// RuntimeFor returns the runtime text for language, falling back to English.
-func RuntimeFor(language string) *Runtime {
-	if c, ok := runtimes[language]; ok {
-		return c
+// DefaultText returns the default text for language, English for languages
+// without their own.
+func DefaultText(language llm.Language) Text {
+	if t, ok := texts[language]; ok {
+		return t
 	}
-	return runtimes["en"]
+	return texts[llm.English]
+}
+
+// withOverrides returns t with the non-empty fields of o.
+func (t Text) withOverrides(o Text) Text {
+	base, over := reflect.ValueOf(&t).Elem(), reflect.ValueOf(o)
+	for i := range base.NumField() {
+		if s := over.Field(i).String(); s != "" {
+			base.Field(i).SetString(s)
+		}
+	}
+	return t
 }

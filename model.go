@@ -14,7 +14,6 @@ import (
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 
-	"github.com/runforyou-ai/einorun/internal/prompt"
 	"github.com/runforyou-ai/einorun/llm"
 )
 
@@ -58,7 +57,7 @@ func (*argumentsNormalizer) BeforeModelRewriteState(ctx context.Context, state *
 // newPatchHandler patches calls without a result before every model call:
 // with the result results returns for them, or a cancellation note. Orphaned
 // and duplicate results are removed.
-func newPatchHandler(ctx context.Context, text *prompt.Runtime, results func(callID string) (string, bool)) (adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage], error) {
+func newPatchHandler(ctx context.Context, text *Text, results func(callID string) (string, bool)) (adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage], error) {
 	handler, err := patchtoolcalls.NewTyped[*schema.AgenticMessage](ctx, &patchtoolcalls.Config{
 		RemoveOrphanResults: true, RemoveDuplicateResults: true,
 		PatchedToolResultGenerator: func(_ context.Context, name, callID string, _ *schema.ToolArgument) (*patchtoolcalls.PatchedToolResult, error) {
@@ -83,7 +82,7 @@ func newPatchHandler(ctx context.Context, text *prompt.Runtime, results func(cal
 type modelRetry struct {
 	runID   string
 	enabled *atomic.Bool
-	text    *prompt.Runtime
+	text    *Text
 
 	// discard, when set, takes the usage of discarded outputs in place of
 	// the retry's own count.

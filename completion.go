@@ -10,8 +10,6 @@ import (
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
-
-	"github.com/runforyou-ai/einorun/internal/prompt"
 )
 
 // completionState keeps the run's completion protocol: the active
@@ -22,7 +20,7 @@ type completionState struct {
 	tools  []string // completion tool names, sorted
 	policy *CompletionPolicy
 	limit  int
-	text   *prompt.Runtime
+	text   *Text
 	save   func(ctx context.Context) error // saves a step with the active completion
 	spent  func() bool                     // the current model call is at the end of the iteration budget
 

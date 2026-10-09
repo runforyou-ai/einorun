@@ -8,6 +8,8 @@
 - Built-in extensions: `Planning` (task list published as the run's plan), `Subagent` (delegation with sub-agent calls recorded under the delegation call) and `Skills` (Eino skills, forked skills run in a sub-agent).
 - `memory`: `Recall` extension that shows the memories relevant to each turn, and `Extract` for memory changes from a conversation. Extensions get the run's model through `RunScope.Model`, report its usage with `UsageReporter` and reserve context for text they add to model calls with `ContextReserver`; `IsInput` tells claimed input apart from messages the runtime adds.
 - `examples/chat`: a command-line agent with the in-memory feed, a provider model, a tool, the task list and sub-agents.
+- `AgentScope.ID` tells agents apart, parallel sub-agents included; `Request.BuiltinTools` gives notes and policies to the tools the runtime and built-in extensions add; `Config.Text` overrides the runtime's model-facing text (`Text`, `DefaultText`), and `Runtime.InterruptedOutcome` settles interrupted calls outside a run with the same text.
+- `journaltest` writes UUIDv7 IDs, compares payloads as JSON and lets feeds that derive messages from their own records report what they store.
 - `stream`: display snapshots and deltas of a run.
 - `llm`: model contract, `Generate` and `GenerateObject`.
 - Run records, the `Feed` and `Journal` contracts and `MergeCall`.
