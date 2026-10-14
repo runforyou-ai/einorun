@@ -112,7 +112,7 @@ func CountTokens(_ context.Context, messages []*schema.AgenticMessage, tools []*
 				total += llm.EstimateTokens(b.Reasoning.Text)
 			case schema.ContentBlockTypeUserInputText:
 				total += llm.EstimateTokens(b.UserInputText.Text)
-			case schema.ContentBlockTypeUserInputImage, schema.ContentBlockTypeUserInputAudio, schema.ContentBlockTypeUserInputVideo:
+			case schema.ContentBlockTypeUserInputImage, schema.ContentBlockTypeUserInputAudio, schema.ContentBlockTypeUserInputVideo, schema.ContentBlockTypeUserInputFile:
 				media++
 			case schema.ContentBlockTypeAssistantGenText:
 				total += llm.EstimateTokens(b.AssistantGenText.Text)

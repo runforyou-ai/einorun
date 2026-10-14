@@ -32,6 +32,8 @@ const (
 	Audio Modality = "audio"
 	// Video is video input.
 	Video Modality = "video"
+	// File is document file input such as PDF.
+	File Modality = "file"
 )
 
 // ModelOptions are the request options a ModelFactory applies.

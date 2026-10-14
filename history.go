@@ -40,15 +40,82 @@ var inlineTypes = map[string]llm.Modality{
 	"video/mp4":       llm.Video,
 	"video/webm":      llm.Video,
 	"video/quicktime": llm.Video,
+	"application/pdf": llm.File,
 }
 
 // mediaPolicy is how media reaches the model.
 type mediaPolicy struct {
-	read       MediaReader
-	modalities map[llm.Modality]bool
-	maxCount   int
-	enabled    *atomic.Bool // false once the model rejected media
-	budget     *mediaBudget
+	read         MediaReader
+	url          MediaURLFunc
+	adapt        MediaAdapter
+	modalities   map[llm.Modality]bool
+	maxCount     int
+	enabled      *atomic.Bool // false once the model rejected native media
+	budget       *mediaBudget
+	projections  *projectionCache
+	text         *Text
+}
+
+// projectionCache remembers text projections by media key and digest so a
+// resumed run does not call the adapter again.
+type projectionCache struct {
+	mu    sync.Mutex
+	texts map[string]string
+}
+
+func newProjectionCache() *projectionCache {
+	return &projectionCache{texts: map[string]string{}}
+}
+
+func projectionKey(ref MediaRef) string {
+	return ref.Key + "\x00" + ref.SHA256
+}
+
+func (c *projectionCache) get(ref MediaRef) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	text, ok := c.texts[projectionKey(ref)]
+	return text, ok
+}
+
+func (c *projectionCache) put(ref MediaRef, text string) {
+	if c == nil || text == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.texts[projectionKey(ref)] = text
+}
+
+func (c *projectionCache) snapshot() map[string]string {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.texts) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(c.texts))
+	for k, v := range c.texts {
+		out[k] = v
+	}
+	return out
+}
+
+func (c *projectionCache) restore(texts map[string]string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.texts = map[string]string{}
+	for k, v := range texts {
+		c.texts[k] = v
+	}
 }
 
 // mediaBudget counts the media sent inline in a run, shared by input
@@ -112,8 +179,9 @@ type history struct {
 }
 
 // appendInput adds the messages not yet in the history, by ID and revision,
-// after the previous turn. Supported user attachments are sent inline, newest
-// first, within the media budget; the rest stay links in the text.
+// after the previous turn. Supported user attachments are sent inline (URL
+// first), newest first, within the media budget; unsupported media is
+// projected when an adapter is set, otherwise stays links in the text.
 func (h *history) appendInput(ctx context.Context, messages []Message, media mediaPolicy) []*schema.AgenticMessage {
 	if h.seen == nil {
 		h.seen = map[string]bool{}
@@ -127,18 +195,14 @@ func (h *history) appendInput(ctx context.Context, messages []Message, media med
 		}
 	}
 	inline := map[int]*schema.AgenticMessage{}
-	if media.read != nil && media.enabled.Load() {
+	if media.read != nil || media.url != nil || media.adapt != nil {
 		for i := len(fresh) - 1; i >= 0; i-- {
 			ref := fresh[i].Media
 			if ref == nil || fresh[i].Role != RoleUser {
 				continue
 			}
-			modality, ok := inlineTypes[ref.MIME]
-			if !ok || !media.modalities[modality] {
-				continue
-			}
-			message, size, ok := mediaMessage(ctx, fresh[i], modality, media.read)
-			if !ok || !media.budget.reserve(size, media.maxCount) {
+			message, ok := media.materializeInput(ctx, fresh[i])
+			if !ok {
 				continue
 			}
 			inline[i] = message
@@ -159,19 +223,6 @@ func (h *history) appendInput(ctx context.Context, messages []Message, media med
 		h.messages = append(h.messages, message)
 	}
 	return slices.Clone(h.messages)
-}
-
-// mediaMessage reads an attachment and returns a user message with its text
-// and the media, and the bytes read; false when it cannot be read.
-func mediaMessage(ctx context.Context, m Message, modality llm.Modality, read MediaReader) (*schema.AgenticMessage, int64, bool) {
-	data, err := readMedia(ctx, read, *m.Media)
-	if err != nil {
-		slog.WarnContext(ctx, "einorun: reading an attachment failed, keeping its link only", "message_id", m.ID, "error", err)
-		return nil, 0, false
-	}
-	return &schema.AgenticMessage{Role: schema.AgenticRoleTypeUser, ContentBlocks: []*schema.ContentBlock{
-		schema.NewContentBlock(&schema.UserInputText{Text: m.Content}), inputBlock(modality, data, m.Media.MIME),
-	}}, int64(len(data)), true
 }
 
 // appendOutput keeps model outputs with text or tool calls and all tool
@@ -263,7 +314,7 @@ func carriesMedia(input []*schema.AgenticMessage) bool {
 				continue
 			}
 			switch b.Type {
-			case schema.ContentBlockTypeUserInputImage, schema.ContentBlockTypeUserInputAudio, schema.ContentBlockTypeUserInputVideo:
+			case schema.ContentBlockTypeUserInputImage, schema.ContentBlockTypeUserInputAudio, schema.ContentBlockTypeUserInputVideo, schema.ContentBlockTypeUserInputFile:
 				return true
 			case schema.ContentBlockTypeFunctionToolResult:
 				if b.FunctionToolResult == nil {
@@ -293,7 +344,7 @@ func withoutMedia(input []*schema.AgenticMessage, text *Text) []*schema.AgenticM
 		stripped.ContentBlocks = make([]*schema.ContentBlock, 0, len(m.ContentBlocks))
 		for _, b := range m.ContentBlocks {
 			switch {
-			case b.Type == schema.ContentBlockTypeUserInputImage, b.Type == schema.ContentBlockTypeUserInputAudio, b.Type == schema.ContentBlockTypeUserInputVideo:
+			case b.Type == schema.ContentBlockTypeUserInputImage, b.Type == schema.ContentBlockTypeUserInputAudio, b.Type == schema.ContentBlockTypeUserInputVideo, b.Type == schema.ContentBlockTypeUserInputFile:
 			case b.Type == schema.ContentBlockTypeFunctionToolResult && b.FunctionToolResult != nil:
 				result := *b.FunctionToolResult
 				result.Content = make([]*schema.FunctionToolResultContentBlock, 0, len(b.FunctionToolResult.Content))

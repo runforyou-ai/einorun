@@ -38,10 +38,11 @@ type state struct {
 	Version      int                        `json:"version"`
 	Messages     []checkpoint.Message       `json:"messages"`
 	Seen         []string                   `json:"seen,omitempty"`
-	MediaCount   int                        `json:"mediaCount"`
-	MediaBytes   int64                      `json:"mediaBytes"`
-	MediaEnabled bool                       `json:"mediaEnabled"`
-	MediaPending map[string][]MediaRef      `json:"mediaPending,omitempty"`
+	MediaCount       int                        `json:"mediaCount"`
+	MediaBytes       int64                      `json:"mediaBytes"`
+	MediaEnabled     bool                       `json:"mediaEnabled"`
+	MediaPending     map[string][]MediaRef      `json:"mediaPending,omitempty"`
+	MediaProjections map[string]string          `json:"mediaProjections,omitempty"`
 	ClaimedSeq   int64                      `json:"claimedSeq"`
 	Turns        int                        `json:"turns"`
 	Iterations   int                        `json:"iterations"`
@@ -171,7 +172,11 @@ func (r *Runtime) assemble(ctx context.Context, request Request) (*execution, er
 
 	enabled := &atomic.Bool{}
 	enabled.Store(true)
-	e.media = mediaPolicy{read: request.ReadMedia, modalities: map[llm.Modality]bool{}, enabled: enabled, budget: &mediaBudget{}}
+	e.media = mediaPolicy{
+		read: request.ReadMedia, url: request.MediaURL, adapt: request.AdaptMedia,
+		modalities: map[llm.Modality]bool{}, enabled: enabled, budget: &mediaBudget{},
+		projections: newProjectionCache(), text: text,
+	}
 	for _, m := range request.Model.Inputs {
 		e.media.modalities[m] = true
 	}
@@ -934,6 +939,7 @@ func (e *execution) encodeState(plan *[]PlanTask) ([]byte, error) {
 	s := state{
 		Version: checkpointVersion, Messages: messages, Seen: slices.Sorted(maps.Keys(e.history.seen)),
 		MediaEnabled: e.media.enabled.Load(), MediaPending: e.injector.pendingRefs(),
+		MediaProjections: e.media.projections.snapshot(),
 		ClaimedSeq: e.inputs.boundary(), Turns: e.turns, Iterations: e.budget.count(), Corrections: used,
 		Completion: active, Usage: e.totalUsage(), KeepFromID: e.summary.keptFrom(), Offloaded: e.offloaded.snapshot(),
 	}
@@ -1064,6 +1070,7 @@ func (e *execution) restore(ctx context.Context) (bool, error) {
 		e.history.seen[key] = true
 	}
 	e.media.budget.restore(s.MediaCount, s.MediaBytes)
+	e.media.projections.restore(s.MediaProjections)
 	e.injector.restore(s.MediaPending)
 	for id, refs := range restoredMedia {
 		e.injector.add(id, refs)

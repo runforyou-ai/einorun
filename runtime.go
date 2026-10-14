@@ -95,6 +95,10 @@ const (
 // MediaReader reads media the host stores.
 type MediaReader func(ctx context.Context, ref MediaRef) ([]byte, error)
 
+// MediaURLFunc returns a stable URL the model provider can fetch for ref.
+// Empty URL or an error falls back to ReadMedia and base64.
+type MediaURLFunc func(ctx context.Context, ref MediaRef) (string, error)
+
 // Request is one run.
 type Request struct {
 	RunID string
@@ -109,8 +113,15 @@ type Request struct {
 	// Resume continues a run from its last checkpoint.
 	Resume *Resume
 	// ReadMedia reads the media of messages and tool results; nil means
-	// media is only referred to in text.
+	// media is only referred to in text unless MediaURL succeeds.
 	ReadMedia MediaReader
+	// MediaURL returns a fetchable URL for media; tried before ReadMedia
+	// when sending native blocks to the model.
+	MediaURL MediaURLFunc
+	// AdaptMedia projects media the model cannot take natively; nil means
+	// unsupported media becomes an unavailable note (tool path) or stays a
+	// text link (user attachments).
+	AdaptMedia MediaAdapter
 	// Stream receives the run's display deltas, serially; it must not block.
 	Stream func(stream.Delta)
 	// StreamID identifies the stream of this execution attempt; empty means a

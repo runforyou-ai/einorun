@@ -239,7 +239,7 @@ func discoverOpenRouter(ctx context.Context, client httpx.Doer, endpoint Endpoin
 			switch m := llm.Modality(modality); m {
 			case "text":
 				text = true
-			case llm.Image, llm.Audio, llm.Video:
+			case llm.Image, llm.Audio, llm.Video, llm.File:
 				if !slices.Contains(model.Inputs, m) {
 					model.Inputs = append(model.Inputs, m)
 				}

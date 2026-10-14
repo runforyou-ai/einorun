@@ -172,7 +172,7 @@ func TestDiscovery(t *testing.T) {
 		t.Fatalf("ollama details %+v", models)
 	}
 	models, err = discovery.Discover(ctx, nil, discovery.Endpoint{Brand: vendor.OpenRouter, BaseURL: ts.URL + "/api/v1"})
-	if err != nil || len(models) != 2 || models[0].MaxOutputTokens != 100 || !slices.Equal(models[0].Inputs, []llm.Modality{llm.Image}) || models[1].Type != discovery.Embedding {
+	if err != nil || len(models) != 2 || models[0].MaxOutputTokens != 100 || !slices.Equal(models[0].Inputs, []llm.Modality{llm.Image, llm.File}) || models[1].Type != discovery.Embedding {
 		t.Fatalf("openrouter %+v %v", models, err)
 	}
 	if _, err := discovery.Discover(ctx, nil, discovery.Endpoint{Brand: vendor.Anthropic, BaseURL: ts.URL}); !errors.Is(err, discovery.ErrUnsupported) {

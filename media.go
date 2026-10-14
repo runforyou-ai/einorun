@@ -44,30 +44,142 @@ func readMedia(ctx context.Context, read MediaReader, ref MediaRef) ([]byte, err
 	return data, nil
 }
 
-// inputBlock returns a user input block with media.
-func inputBlock(modality llm.Modality, data []byte, mime string) *schema.ContentBlock {
-	encoded := base64.StdEncoding.EncodeToString(data)
+// resolveWire prefers a fetchable URL, then bytes for base64.
+func (p mediaPolicy) resolveWire(ctx context.Context, ref MediaRef) (url string, data []byte, size int64, err error) {
+	if p.url != nil {
+		u, uerr := p.url(ctx, ref)
+		if uerr == nil && u != "" {
+			size = ref.Size
+			if size <= 0 {
+				size = 1
+			}
+			return u, nil, size, nil
+		}
+		if uerr != nil {
+			slog.WarnContext(ctx, "einorun: resolving media URL failed, falling back to bytes", "key", ref.Key, "error", uerr)
+		}
+	}
+	data, err = readMedia(ctx, p.read, ref)
+	if err != nil {
+		return "", nil, 0, err
+	}
+	return "", data, int64(len(data)), nil
+}
+
+// accepted lists the modalities in the policy for adapters.
+func (p mediaPolicy) accepted() []llm.Modality {
+	out := make([]llm.Modality, 0, len(p.modalities))
+	for m, ok := range p.modalities {
+		if ok {
+			out = append(out, m)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// canNative reports whether ref may be sent as a native block right now.
+func (p mediaPolicy) canNative(ref MediaRef) (llm.Modality, bool) {
+	modality, ok := inlineTypes[ref.MIME]
+	if !ok || !p.modalities[modality] || !p.enabled.Load() {
+		return "", false
+	}
+	return modality, true
+}
+
+// inputBlock returns a user input block with media (URL preferred).
+func inputBlock(modality llm.Modality, url string, data []byte, mime string) *schema.ContentBlock {
+	encoded := ""
+	if url == "" && len(data) > 0 {
+		encoded = base64.StdEncoding.EncodeToString(data)
+	}
 	switch modality {
 	case llm.Audio:
-		return schema.NewContentBlock(&schema.UserInputAudio{Base64Data: encoded, MIMEType: mime})
+		return schema.NewContentBlock(&schema.UserInputAudio{URL: url, Base64Data: encoded, MIMEType: mime})
 	case llm.Video:
-		return schema.NewContentBlock(&schema.UserInputVideo{Base64Data: encoded, MIMEType: mime})
+		return schema.NewContentBlock(&schema.UserInputVideo{URL: url, Base64Data: encoded, MIMEType: mime})
+	case llm.File:
+		return schema.NewContentBlock(&schema.UserInputFile{URL: url, Base64Data: encoded, MIMEType: mime})
 	default:
-		return schema.NewContentBlock(&schema.UserInputImage{Base64Data: encoded, MIMEType: mime})
+		return schema.NewContentBlock(&schema.UserInputImage{URL: url, Base64Data: encoded, MIMEType: mime})
 	}
 }
 
-// resultPart returns a tool result part with media.
-func resultPart(modality llm.Modality, data []byte, mime string) *schema.FunctionToolResultContentBlock {
-	encoded := base64.StdEncoding.EncodeToString(data)
+// resultPart returns a tool result part with media (URL preferred).
+func resultPart(modality llm.Modality, url string, data []byte, mime string) *schema.FunctionToolResultContentBlock {
+	encoded := ""
+	if url == "" && len(data) > 0 {
+		encoded = base64.StdEncoding.EncodeToString(data)
+	}
 	switch modality {
 	case llm.Audio:
-		return &schema.FunctionToolResultContentBlock{Type: schema.FunctionToolResultContentBlockTypeAudio, Audio: &schema.UserInputAudio{Base64Data: encoded, MIMEType: mime}}
+		return &schema.FunctionToolResultContentBlock{Type: schema.FunctionToolResultContentBlockTypeAudio, Audio: &schema.UserInputAudio{URL: url, Base64Data: encoded, MIMEType: mime}}
 	case llm.Video:
-		return &schema.FunctionToolResultContentBlock{Type: schema.FunctionToolResultContentBlockTypeVideo, Video: &schema.UserInputVideo{Base64Data: encoded, MIMEType: mime}}
+		return &schema.FunctionToolResultContentBlock{Type: schema.FunctionToolResultContentBlockTypeVideo, Video: &schema.UserInputVideo{URL: url, Base64Data: encoded, MIMEType: mime}}
+	case llm.File:
+		return &schema.FunctionToolResultContentBlock{Type: schema.FunctionToolResultContentBlockTypeFile, File: &schema.UserInputFile{URL: url, Base64Data: encoded, MIMEType: mime}}
 	default:
-		return &schema.FunctionToolResultContentBlock{Type: schema.FunctionToolResultContentBlockTypeImage, Image: &schema.UserInputImage{Base64Data: encoded, MIMEType: mime}}
+		return &schema.FunctionToolResultContentBlock{Type: schema.FunctionToolResultContentBlockTypeImage, Image: &schema.UserInputImage{URL: url, Base64Data: encoded, MIMEType: mime}}
 	}
+}
+
+// materializeInput builds a user message with native media and/or projected
+// text; false leaves the caller to emit text-only content.
+func (p mediaPolicy) materializeInput(ctx context.Context, m Message) (*schema.AgenticMessage, bool) {
+	ref := *m.Media
+	content := m.Content
+	blocks := []*schema.ContentBlock{schema.NewContentBlock(&schema.UserInputText{Text: content})}
+	if modality, ok := p.canNative(ref); ok {
+		url, data, size, err := p.resolveWire(ctx, ref)
+		switch {
+		case errors.Is(err, errMediaChanged):
+			slog.WarnContext(ctx, "einorun: attachment changed since it was referenced, keeping its link only", "message_id", m.ID)
+			return nil, false
+		case err != nil:
+			slog.WarnContext(ctx, "einorun: reading an attachment failed, keeping its link only", "message_id", m.ID, "error", err)
+			return nil, false
+		case !p.budget.reserve(size, p.maxCount):
+			return nil, false
+		default:
+			blocks = append(blocks, inputBlock(modality, url, data, ref.MIME))
+			return &schema.AgenticMessage{Role: schema.AgenticRoleTypeUser, ContentBlocks: blocks}, true
+		}
+	}
+	text, ok := p.projectText(ctx, ref)
+	if !ok || text == "" {
+		return nil, false
+	}
+	if content != "" {
+		text = content + "\n" + text
+	}
+	return schema.UserAgenticMessage(text), true
+}
+
+// projectText runs the adapter (or cache) and returns projected text.
+func (p mediaPolicy) projectText(ctx context.Context, ref MediaRef) (string, bool) {
+	if cached, ok := p.projections.get(ref); ok {
+		return cached, true
+	}
+	if p.adapt == nil {
+		return "", false
+	}
+	adaptation, err := p.adapt.Adapt(ctx, ref, AdaptPolicy{Accepted: p.accepted(), MaxBytes: maxMediaBytes})
+	if err != nil {
+		slog.WarnContext(ctx, "einorun: adapting media failed", "key", ref.Key, "error", err)
+		return "", false
+	}
+	var parts []string
+	for _, part := range adaptation.Parts {
+		if part.Modality == nil && part.Text != "" {
+			parts = append(parts, part.Text)
+		}
+	}
+	text := strings.Join(parts, "\n")
+	if text == "" {
+		return "", false
+	}
+	p.projections.put(ref, text)
+	return text, true
 }
 
 // mediaInjector passes the media of tool results to the model before the
@@ -121,7 +233,9 @@ func (m *mediaInjector) restore(pending map[string][]MediaRef) {
 type item struct {
 	ref      MediaRef
 	modality llm.Modality
+	url      string
 	data     []byte
+	text     string
 	note     string
 }
 
@@ -191,11 +305,7 @@ func (m *mediaInjector) BeforeModelRewriteState(ctx context.Context, state *adk.
 		for _, id := range ready {
 			carrier := &schema.AgenticMessage{Role: schema.AgenticRoleTypeUser, Extra: map[string]any{mediaExtraKey: id}}
 			for _, it := range items[id] {
-				if it.data != nil {
-					carrier.ContentBlocks = append(carrier.ContentBlocks, inputBlock(it.modality, it.data, it.ref.MIME))
-				} else {
-					carrier.ContentBlocks = append(carrier.ContentBlocks, schema.NewContentBlock(&schema.UserInputText{Text: it.note}))
-				}
+				carrier.ContentBlocks = append(carrier.ContentBlocks, itemBlocks(it)...)
 			}
 			injected[id] = carrier
 			carriers = append(carriers, carrier)
@@ -215,6 +325,18 @@ func (m *mediaInjector) BeforeModelRewriteState(ctx context.Context, state *adk.
 	return ctx, state, nil
 }
 
+// itemBlocks turns a loaded item into content blocks.
+func itemBlocks(it *item) []*schema.ContentBlock {
+	switch {
+	case it.url != "" || len(it.data) > 0:
+		return []*schema.ContentBlock{inputBlock(it.modality, it.url, it.data, it.ref.MIME)}
+	case it.text != "":
+		return []*schema.ContentBlock{schema.NewContentBlock(&schema.UserInputText{Text: it.text})}
+	default:
+		return []*schema.ContentBlock{schema.NewContentBlock(&schema.UserInputText{Text: it.note})}
+	}
+}
+
 // intoResults adds the media of the ready calls to their result blocks.
 func intoResults(message *schema.AgenticMessage, ready []string, items map[string][]*item) *schema.AgenticMessage {
 	copied := *message
@@ -226,9 +348,12 @@ func intoResults(message *schema.AgenticMessage, ready []string, items map[strin
 		result := *b.FunctionToolResult
 		result.Content = slices.Clone(result.Content)
 		for _, it := range items[result.CallID] {
-			if it.data != nil {
-				result.Content = append(result.Content, resultPart(it.modality, it.data, it.ref.MIME))
-			} else {
+			switch {
+			case it.url != "" || len(it.data) > 0:
+				result.Content = append(result.Content, resultPart(it.modality, it.url, it.data, it.ref.MIME))
+			case it.text != "":
+				result.Content = append(result.Content, &schema.FunctionToolResultContentBlock{Type: schema.FunctionToolResultContentBlockTypeText, Text: &schema.UserInputText{Text: it.text}})
+			default:
 				result.Content = append(result.Content, &schema.FunctionToolResultContentBlock{Type: schema.FunctionToolResultContentBlockTypeText, Text: &schema.UserInputText{Text: it.note}})
 			}
 		}
@@ -239,30 +364,33 @@ func intoResults(message *schema.AgenticMessage, ready []string, items map[strin
 	return &copied
 }
 
-// load reads media the model can view within the budget, charged by the bytes
-// actually read, or returns the note that replaces it.
+// load resolves media the model can view within the budget, or projects /
+// notes when it cannot.
 func (m *mediaInjector) load(ctx context.Context, ref MediaRef) *item {
 	it := &item{ref: ref}
-	modality, ok := inlineTypes[ref.MIME]
-	if !ok || !m.policy.modalities[modality] || !m.policy.enabled.Load() || m.policy.read == nil {
-		it.note = fmt.Sprintf(m.text.MediaUnavailable, cmpOr(ref.MIME, "media"))
+	if modality, ok := m.policy.canNative(ref); ok {
+		url, data, size, err := m.policy.resolveWire(ctx, ref)
+		switch {
+		case errors.Is(err, errMediaChanged):
+			it.note = fmt.Sprintf(m.text.MediaChanged, ref.Key)
+			return it
+		case err != nil:
+			slog.WarnContext(ctx, "einorun: reading tool result media failed", "key", ref.Key, "error", err)
+			it.note = fmt.Sprintf(m.text.MediaUnavailable, ref.MIME)
+			return it
+		case !m.policy.budget.reserve(size, m.policy.maxCount):
+			it.note = fmt.Sprintf(m.text.MediaOverBudget, ref.Key)
+			return it
+		default:
+			it.modality, it.url, it.data = modality, url, data
+			return it
+		}
+	}
+	if text, ok := m.policy.projectText(ctx, ref); ok && text != "" {
+		it.text = text
 		return it
 	}
-	data, err := readMedia(ctx, m.policy.read, ref)
-	switch {
-	case errors.Is(err, errMediaChanged):
-		it.note = fmt.Sprintf(m.text.MediaChanged, ref.Key)
-		return it
-	case err != nil:
-		slog.WarnContext(ctx, "einorun: reading tool result media failed", "key", ref.Key, "error", err)
-		it.note = fmt.Sprintf(m.text.MediaUnavailable, ref.MIME)
-		return it
-	}
-	if !m.policy.budget.reserve(int64(len(data)), m.policy.maxCount) {
-		it.note = fmt.Sprintf(m.text.MediaOverBudget, ref.Key)
-		return it
-	}
-	it.modality, it.data = modality, data
+	it.note = fmt.Sprintf(m.text.MediaUnavailable, cmpOr(ref.MIME, "media"))
 	return it
 }
 

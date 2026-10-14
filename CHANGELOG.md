@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-10-14
+
+- Media prefers a stable URL from `Request.MediaURL`, then base64 from `ReadMedia`.
+- Optional `Request.AdaptMedia` projects media the model cannot take natively (OCR, transcript, documents); projections are checkpointed.
+- `llm.File` modality and `application/pdf` on the inline allow-list; discovery accepts `file` inputs.
+
 ## 0.2.0 - 2026-10-10
 
 - Calls can pause for a decision: `CallPolicy.Confirm` records the call as `awaiting_decision` and suspends the run; the host writes `ToolCall.Decision` (approve, approve with changed arguments, or reject with a reason), and on resume the runtime carries it out within the same turn. New `StatusRejected`; `MergeCall` keeps the host's decision and `OverlayExternal` writes it; `journaltest` checks it; new texts `CannotConfirm`, `CallRejected` and `CallEdited`.

@@ -507,26 +507,35 @@ type Closer          interface { Close() error }
 ```go
 type MediaRef struct { Key, MIME, SHA256 string; Size int64 }
 ReadMedia func(ctx context.Context, ref MediaRef) ([]byte, error)
+MediaURL  func(ctx context.Context, ref MediaRef) (string, error)
+AdaptMedia MediaAdapter // optional host projection (OCR, transcript, …)
 ```
 
-- Hosts store media bytes and namespace their keys; tools return references
-  with `AttachMedia(ctx, refs...)` and return their text as usual, so large text is still offloaded. References are saved with the call when it settles.
-- Media is charged by the bytes actually read (at most 10 MiB per item).
-  Media that cannot be passed becomes a note saying why: the model cannot
-  view it, it changed since it was read, or the budget is spent.
+- Hosts store media and namespace their keys; tools return references with
+  `AttachMedia(ctx, refs...)` and return their text as usual, so large text is
+  still offloaded. References are saved with the call when it settles.
+- Native wire form prefers a stable URL from `MediaURL`, then bytes from
+  `ReadMedia` as base64. Budget uses the reported size (URL) or bytes read
+  (at most 10 MiB per item). Media that cannot be passed becomes a note saying
+  why: the model cannot view it, it changed since it was read, or the budget
+  is spent.
 - Inline formats are an allow-list (png, jpeg, webp, gif, wav variants, mp4,
-  webm, quicktime) and only for modalities the model declares. Media is chosen
-  newest first within 20% of the context window (1280 tokens per item, at
-  least one) and 20 MiB per run, shared by main and sub-agents.
-- A modality the model lacks becomes a text note. A modality the model accepts
-  but cannot receive inside tool results (`ToolResultMedia` false) is attached
-  as a user message right after the result.
-- Checkpoints keep the bytes of media already in the model context and only
-  the references of media not yet attached. On recovery references are read
-  back and checked against SHA256; mismatches are not attached.
-- When a request carrying media fails, multimodal input is turned off for the
-  rest of the run (checkpointed). This is a deliberately conservative reaction
-  to any failure of such a request.
+  webm, quicktime, application/pdf as `file`) and only for modalities the
+  model declares. Media is chosen newest first within 20% of the context
+  window (1280 tokens per item, at least one) and 20 MiB per run, shared by
+  main and sub-agents.
+- A modality the model lacks is projected through `AdaptMedia` when set
+  (text OCR/transcript/document); otherwise a tool-result note, or a user
+  attachment kept as a text link. Native and projection are not combined by
+  default. A modality the model accepts but cannot receive inside tool
+  results (`ToolResultMedia` false) is attached as a user message right after
+  the result.
+- Checkpoints keep media already in the model context, references of media
+  not yet attached, and cached text projections. On recovery references are
+  resolved again (URL or bytes with SHA256); mismatches are not attached.
+- When a request carrying native media fails, multimodal input is turned off
+  for the rest of the run (checkpointed); projection may still run. This is a
+  deliberately conservative reaction to any failure of such a request.
 
 ## Context management
 
