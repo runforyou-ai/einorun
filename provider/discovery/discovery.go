@@ -60,21 +60,26 @@ const ollamaDetailConcurrency = 4
 const DefaultTimeout = time.Minute
 
 // Discover reads the models of endpoint. Brands whose preset does not support
-// discovery fail with ErrUnsupported. A nil client means one that never
-// follows redirects and times out after DefaultTimeout.
+// discovery fail with ErrUnsupported. Ollama and OpenRouter keep dedicated
+// readers; every other discovery-enabled brand uses the OpenAI-compatible
+// GET .../models list. A nil client means one that never follows redirects and
+// times out after DefaultTimeout.
 func Discover(ctx context.Context, client httpx.Doer, endpoint Endpoint) ([]Model, error) {
 	if client == nil {
 		client = httpx.NewClient(DefaultTimeout)
+	}
+	preset, ok := vendor.Of(endpoint.Brand)
+	if !ok || !preset.Discovery {
+		return nil, fmt.Errorf("%w: %s", ErrUnsupported, endpoint.Brand)
 	}
 	switch endpoint.Brand {
 	case vendor.Ollama:
 		return discoverOllama(ctx, client, endpoint)
 	case vendor.OpenRouter:
 		return discoverOpenRouter(ctx, client, endpoint)
-	case vendor.OpenAICompatible:
+	default:
 		return discoverCompatible(ctx, client, endpoint)
 	}
-	return nil, fmt.Errorf("%w: %s", ErrUnsupported, endpoint.Brand)
 }
 
 // discoverOllama lists installed models and reads their capabilities and

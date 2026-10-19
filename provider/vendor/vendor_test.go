@@ -59,3 +59,16 @@ func TestAppendPath(t *testing.T) {
 		t.Fatalf("%q %v", got, err)
 	}
 }
+
+func TestDiscoveryFlags(t *testing.T) {
+	for _, brand := range Brands() {
+		preset, ok := Of(brand)
+		if !ok {
+			t.Fatalf("%s unknown", brand)
+		}
+		want := brand != Manual
+		if preset.Discovery != want {
+			t.Fatalf("%s Discovery=%v, want %v", brand, preset.Discovery, want)
+		}
+	}
+}

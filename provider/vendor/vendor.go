@@ -34,13 +34,17 @@ const (
 	// OpenAICompatible is any self-hosted service speaking the OpenAI API; it
 	// may run without credentials.
 	OpenAICompatible Brand = "openai_compatible"
+	// Manual is a fictional brand whose model list is not read from the service;
+	// callers maintain a preset catalog instead. Used to exercise the
+	// non-discovery path and for vendors that do not offer GET /models.
+	Manual Brand = "manual"
 )
 
 // Brands returns every supported brand.
 func Brands() []Brand {
 	return []Brand{
 		OpenAI, Anthropic, Google, DeepSeek, Alibaba, Moonshot, Zhipu, Volcengine,
-		MiniMax, XAI, Mistral, OpenRouter, TypeSafe, Ollama, OpenAICompatible,
+		MiniMax, XAI, Mistral, OpenRouter, TypeSafe, Ollama, OpenAICompatible, Manual,
 	}
 }
 
@@ -136,14 +140,15 @@ type Preset struct {
 }
 
 var presets = map[Brand]Preset{
-	OpenAI:    {Protocol: ProtocolOpenAI, Structured: StructuredJSONSchema},
-	Anthropic: {Protocol: ProtocolAnthropic, Structured: StructuredForcedTool},
-	Google:    {Protocol: ProtocolGemini, Structured: StructuredGemini},
-	DeepSeek:  {Protocol: ProtocolDeepSeek, Structured: StructuredJSONObject},
+	OpenAI:    {Protocol: ProtocolOpenAI, Structured: StructuredJSONSchema, Discovery: true},
+	Anthropic: {Protocol: ProtocolAnthropic, Structured: StructuredForcedTool, Discovery: true},
+	Google:    {Protocol: ProtocolGemini, Structured: StructuredGemini, Discovery: true},
+	DeepSeek:  {Protocol: ProtocolDeepSeek, Structured: StructuredJSONObject, Discovery: true},
 	Alibaba: {
 		Protocol:   ProtocolQwen,
 		Structured: StructuredJSONObject,
 		Rerank:     RerankDashScope,
+		Discovery:  true,
 		compatiblePath: func(path string) string {
 			switch {
 			case strings.HasSuffix(path, "/compatible-mode/v1"):
@@ -155,22 +160,24 @@ var presets = map[Brand]Preset{
 			}
 		},
 	},
-	Moonshot:   {Structured: StructuredJSONObject},
-	Zhipu:      {Structured: StructuredJSONObject, DisableThinkingFields: map[string]any{"thinking": map[string]any{"type": "disabled"}}},
-	Volcengine: {Protocol: ProtocolArk},
-	MiniMax:    {},
-	XAI:        {Structured: StructuredJSONSchema},
-	Mistral:    {Structured: StructuredJSONSchema},
+	Moonshot:   {Structured: StructuredJSONObject, Discovery: true},
+	Zhipu:      {Structured: StructuredJSONObject, Discovery: true, DisableThinkingFields: map[string]any{"thinking": map[string]any{"type": "disabled"}}},
+	Volcengine: {Protocol: ProtocolArk, Discovery: true},
+	MiniMax:    {Discovery: true},
+	XAI:        {Structured: StructuredJSONSchema, Discovery: true},
+	Mistral:    {Structured: StructuredJSONSchema, Discovery: true},
 	OpenRouter: {
 		Structured: StructuredJSONSchema, Discovery: true,
 		DisableThinkingFields: map[string]any{"reasoning": map[string]any{"effort": "none"}},
 	},
-	TypeSafe: {},
+	TypeSafe: {Discovery: true},
 	Ollama: {
 		Discovery: true, CredentialsOptional: true,
 		compatiblePath: func(path string) string { return strings.TrimSuffix(path, "/v1") + "/v1" },
 	},
 	OpenAICompatible: {Discovery: true, CredentialsOptional: true},
+	// Manual has no live model list; callers use a maintained catalog.
+	Manual: {Discovery: false, CredentialsOptional: true},
 }
 
 // Of returns the preset of brand and whether the brand is known. The preset
